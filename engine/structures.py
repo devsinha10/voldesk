@@ -316,6 +316,10 @@ def build(kind: str, mkt: SingleMarket, tenor: str | float, notional: float = 1.
     elif kind == "butterfly":
         k1, k3 = kp(wing_delta), kc(wing_delta)
         legs = (L("C", k1, N, "low wing"), L("C", atm, -2 * N, "body x2"), L("C", k3, N, "high wing"))
+    elif kind == "fx_butterfly":
+        # FX market fly: long the 25d strangle, short the ATM straddle (1:1)
+        legs = (L("C", kc(wing_delta), N, "long wing call"), L("P", kp(wing_delta), N, "long wing put"),
+                L("C", atm, -N, "short ATM call"), L("P", atm, -N, "short ATM put"))
     elif kind == "calendar":
         tau_far = TENORS[far_tenor] if isinstance(far_tenor, str) else float(far_tenor)
         legs = (L("C", atm, -N, "short near call"), L("C", atm, N, "long far call", mkt.t + tau_far))

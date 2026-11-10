@@ -23,11 +23,7 @@ from typing import Union
 
 import numpy as np
 from scipy.optimize import brentq
-from scipy.stats import norm
-
-from engine.fx_pricer import cp_sign, d1_d2, forward, price
-
-_N, _n, _Ninv = norm.cdf, norm.pdf, norm.ppf
+from engine.fx_pricer import _N, _Ninv, _n, cp_sign, d1_d2, forward, price
 
 TENORS: dict[str, float] = {
     "ON": 1 / 365, "1W": 7 / 365, "2W": 14 / 365, "1M": 1 / 12, "2M": 2 / 12,
@@ -219,6 +215,25 @@ def strike_from_delta(target_delta: float, S: float, T: float, rd: float, rf: fl
 
     def f(K: float) -> float:
         return delta(S, K, T, rd, rf, vol, phi, convention) - target_delta
+
+    # fast path: Newton on the PA delta, d(delta)/dK = phi*scale/F*[N(phi d2) - n(d2)/(vol sqT)]
+    K = k_unadj
+    for _ in range(30):
+        d2 = (np.log(F / K) - 0.5 * vol * vol * T) / (vol * sqT)
+        val = phi * (K / F) * scale * _N(phi * d2) - target_delta
+        der = phi * scale / F * (_N(phi * d2) - _n(d2) / (vol * sqT))
+        if der == 0 or not np.isfinite(der):
+            break
+        K_new = K - val / der
+        if not (0 < K_new < 50 * F):
+            break
+        if abs(K_new - K) < 1e-13 * F:
+            d2n = (np.log(F / K_new) - 0.5 * vol * vol * T) / (vol * sqT)
+            # for calls make sure we are on the OTM branch (right of the delta peak)
+            if phi == -1 or vol * sqT * _N(d2n) < _n(d2n):
+                return float(K_new)
+            break
+        K = K_new
 
     if phi == 1:
         # strike of max PA call delta: d/dK [K N(d2)] = 0 -> vol sqT N(d2) = n(d2)

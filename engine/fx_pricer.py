@@ -22,13 +22,18 @@ from typing import Protocol, Union, runtime_checkable
 
 import numpy as np
 from scipy.optimize import brentq
-from scipy.stats import norm
+from scipy.special import ndtr, ndtri
 
 ArrayLike = Union[float, np.ndarray]
 
-_N = norm.cdf
-_n = norm.pdf
-_Ninv = norm.ppf
+_SQRT2PI = np.sqrt(2.0 * np.pi)
+_N = ndtr      # standard normal CDF (fast ufunc)
+_Ninv = ndtri  # inverse CDF
+
+
+def _n(x):
+    """Standard normal PDF."""
+    return np.exp(-0.5 * x * x) / _SQRT2PI
 
 
 def cp_sign(call_put: Union[str, int, float]) -> int:

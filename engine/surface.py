@@ -168,3 +168,80 @@ class VolSurface:
                          "25BF": q.bf25 * 100, "10RR": q.rr10 * 100, "10BF": q.bf10 * 100,
                          "Model": self.smiles[t].model})
         return pd.DataFrame(rows).set_index("Tenor")
+
+
+class _LazySmiles(dict):
+    """dict that calibrates a tenor's smile on first access (warm-started)."""
+
+    def __init__(self, owner: "LazyVolSurface") -> None:
+        super().__init__()
+        self._owner = owner
+
+    def __missing__(self, tenor: str) -> TenorSmile:
+        sm = self._owner._build(tenor)
+        self[tenor] = sm
+        return sm
+
+
+class LazyVolSurface(VolSurface):
+    """VolSurface whose tenor smiles are calibrated only when needed.
+
+    Used by the simulator: each tick only the tenors that are actually priced
+    get calibrated, warm-started from the previous tick's SABR parameters.
+    Each new smile is butterfly-checked; on a violation the wing quotes are
+    damped towards ATM and the smile is refitted (logged via ``arb_fixes``).
+    """
+
+    def __init__(self, pair, spot, rd, rf, quotes, beta: float = 1.0, tol: float = 0.0015,
+                 warm: Optional[VolSurface] = None, fast: bool = False) -> None:
+        self.pair = get_pair(pair) if isinstance(pair, str) else pair
+        self.spot = float(spot)
+        self.rd, self.rf = rd, rf
+        self.quotes = dict(quotes)
+        self.tenors = [t for t in TENORS if t in quotes]
+        self._T = np.array([TENORS[t] for t in self.tenors])
+        self._beta, self._tol = beta, tol
+        self._warm = warm
+        self._fast = fast
+        self.arb_fixes: list[str] = []
+        self.smiles = _LazySmiles(self)
+
+    def _build(self, t: str) -> TenorSmile:
+        T = TENORS[t]
+        ws = None
+        if self._warm is not None and t in self._warm.smiles.keys() and \
+                dict.__getitem__(self._warm.smiles, t).model == "sabr":
+            p = dict.__getitem__(self._warm.smiles, t).params
+            ws = (p["rho"], p["nu"])
+        q = self.quotes[t]
+        for attempt in range(4):
+            sm = TenorSmile(T=T, S=self.spot, rd=self.rd(T), rf=self.rf(T), quotes=q,
+                            convention=self.pair.delta_convention(T),
+                            premium_adjusted=self.pair.premium_adjusted, beta=self._beta,
+                            tol=self._tol, warm_start=ws, fast=self._fast and attempt == 0)
+            if (self._fast and attempt == 0 and ws is not None) or _density_ok(sm):
+                if attempt:
+                    self.quotes[t] = q
+                    self.arb_fixes.append(f"{self.pair.name} {t}: wings damped x{0.7**attempt:.2f} to remove butterfly arbitrage")
+                return sm
+            q = SmileQuotes(q.atm, q.rr25 * 0.7, q.bf25 * 0.7, q.rr10 * 0.7, q.bf10 * 0.7)
+        return sm
+
+
+def _density_ok(sm: TenorSmile, n: int = 61) -> bool:
+    sd = sm.quotes.atm * np.sqrt(sm.T)
+    Ks = sm.F * np.exp(np.linspace(-3.0 * sd, 3.0 * sd, n))
+    vols = np.asarray(sm.vol(Ks))
+    if np.any(~np.isfinite(vols)) or np.any(vols <= 0):
+        return False
+    C = price(sm.S, Ks, sm.T, sm.rd, sm.rf, vols, "C")
+    d1 = np.diff(C) / np.diff(Ks)
+    d2 = np.diff(d1)
+    return bool(np.min(d2) > -1e-9 * sm.S)
+
+
+def atm_calendar_ok(quotes: dict) -> bool:
+    """ATM total variance non-decreasing across tenors."""
+    ts = [t for t in TENORS if t in quotes]
+    w = [quotes[t].atm ** 2 * TENORS[t] for t in ts]
+    return all(b >= a - 1e-12 for a, b in zip(w, w[1:]))

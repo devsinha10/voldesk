@@ -76,12 +76,27 @@ def sabr_vol(K: np.ndarray | float, F: float, T: float, alpha: float, beta: floa
 
 def _alpha_for_atm(K_atm: float, F: float, T: float, vol_atm: float, beta: float,
                    rho: float, nu: float) -> float:
-    """Solve alpha so that sabr_vol(K_atm) == vol_atm."""
-    f = lambda a: sabr_vol(K_atm, F, T, a, beta, rho, nu) - vol_atm
+    """Solve alpha so that sabr_vol(K_atm) == vol_atm.
+
+    sabr_vol is close to linear in alpha near the money, so a short fixed-point
+    iteration alpha <- alpha * target / sabr_vol(alpha) converges quickly; fall
+    back to Brent if it does not.
+    """
+    a = vol_atm * F ** (1 - beta)
+    for _ in range(12):
+        v = sabr_vol(K_atm, F, T, a, beta, rho, nu)
+        if not np.isfinite(v) or v <= 0:
+            break
+        a_new = a * vol_atm / v
+        if abs(a_new - a) < 1e-13 * a:
+            return float(a_new)
+        a = a_new
+    else:
+        return float(a)
+    f = lambda x: sabr_vol(K_atm, F, T, x, beta, rho, nu) - vol_atm
     guess = vol_atm * F ** (1 - beta)
-    lo, hi = guess * 0.2, guess * 5.0
     try:
-        return float(brentq(f, lo, hi, xtol=1e-14))
+        return float(brentq(f, guess * 0.2, guess * 5.0, xtol=1e-14))
     except ValueError:
         return guess
 
@@ -105,6 +120,7 @@ class TenorSmile:
     pillar_vols: dict = field(init=False, default_factory=dict)
     fit_errors: dict = field(init=False, default_factory=dict)
     warm_start: Optional[tuple[float, float]] = None
+    fast: bool = False  # keep warm (rho, nu), solve alpha only; full refit if out of tolerance
 
     def __post_init__(self) -> None:
         self.F = float(forward(self.S, self.T, self.rd, self.rf))
@@ -119,6 +135,16 @@ class TenorSmile:
 
     # -- calibration --------------------------------------------------------
     def _calibrate(self) -> None:
+        if self.fast and self.warm_start is not None:
+            rho, nu = self.warm_start
+            F, T, b = self.F, self.T, self.beta
+            alpha = _alpha_for_atm(self.pillar_strikes["ATM"], F, T, self.quotes.atm, b, rho, nu)
+            errs = self._errors(lambda K: sabr_vol(K, F, T, alpha, b, rho, nu))
+            if np.isfinite(alpha) and max(abs(e) for e in errs.values()) <= 0.6 * self.tol:
+                self.model = "sabr"
+                self.params = {"alpha": alpha, "beta": b, "rho": rho, "nu": nu}
+                self.fit_errors = errs
+                return
         names = ["10P", "25P", "25C", "10C"]
         Ks = np.array([self.pillar_strikes[n] for n in names])
         vs = np.array([self.pillar_vols[n] for n in names])
@@ -138,7 +164,7 @@ class TenorSmile:
         starts += [np.array([np.arctanh(np.clip(skew * 3, -0.9, 0.9)), np.log(min(nu0, 8.0))]),
                    np.array([0.0, np.log(1.0)]), np.array([np.sign(skew) * 0.5, np.log(3.0)])]
         best = None
-        for x0 in starts:
+        for i_start, x0 in enumerate(starts):
             try:
                 r = least_squares(resid, x0, method="lm", xtol=1e-12, ftol=1e-12, max_nfev=400)
             except Exception:  # pragma: no cover - defensive
@@ -147,6 +173,8 @@ class TenorSmile:
                 best = r
             if np.max(np.abs(r.fun)) < 0.5:  # < 0.05 vol pts: good enough
                 break
+            if self.warm_start is not None and i_start == 0 and np.max(np.abs(r.fun)) < self.tol * 1e4:
+                break  # warm start already within tolerance (simulator ticks)
         ok = False
         if best is not None:
             rho, nu = float(np.tanh(best.x[0])), float(np.exp(best.x[1]))

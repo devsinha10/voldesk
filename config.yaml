@@ -191,60 +191,78 @@ simulator:
   # Base limits (USD). Multiplied by the level's limit_mult.
   limits:
     delta_usd_per_pair: 50000000      # |delta| in USD equivalent
-    gamma_usd_per_pct: 10000000       # |change in delta (USD) per 1% spot|
+    gamma_usd_per_pct: 25000000       # |change in delta (USD) per 1% spot|
     vega_usd_per_pair: 150000         # |vega per vol pt| per pair
     total_vega_usd: 400000
     breach_penalty_usd_per_tick: 2000
 
-  # Regimes: annualised drift (% of spot), vol multiplier on realised spot vol,
-  # jump intensity (jumps per year), mean jump size (% of spot),
-  # realised/implied ratio range and corr scaling between spot and vol.
+  # Regimes (all CHECK AND TUNE to taste):
+  #   drift_pct_session: size of the trend over the whole session (% of spot) in the trending regime
+  #   rv_iv_ratio: realised spot vol / implied ATM vol, sampled per pair per session
+  #   jumps_per_session: expected spot jumps per currency over the session
+  #   jump_size_pct: mean absolute jump size (% of spot)
+  #   vol_of_vol_pts_day: 1-sd daily move of the ATM vol level (vol points)
+  #   vol_mean_shift: vol points the ATM level drifts towards (e.g. risk-off = higher vol)
+  #   skew_shift: RR shift (vols) towards each pair's risk-off direction
+  #   corr_mult: multiplier on the pair's spot/vol correlation, sampled per session
   regimes:
     calm:
-      drift: 0.0
-      rv_iv_ratio: [0.75, 0.95]
-      jump_intensity: 2
-      jump_size: 0.4
-      vol_of_vol: 0.6
-      vol_mean_shift: -0.3
+      drift_pct_session: 0.0
+      rv_iv_ratio: [0.70, 0.90]
+      jumps_per_session: 0.3
+      jump_size_pct: 0.4
+      vol_of_vol_pts_day: 0.20
+      vol_mean_shift: -0.4
       skew_shift: 0.0
       corr_mult: [0.8, 1.1]
     trending:
-      drift: 12.0
-      rv_iv_ratio: [0.95, 1.2]
-      jump_intensity: 4
-      jump_size: 0.5
-      vol_of_vol: 0.8
-      vol_mean_shift: 0.3
+      drift_pct_session: 3.0
+      rv_iv_ratio: [0.95, 1.20]
+      jumps_per_session: 0.6
+      jump_size_pct: 0.5
+      vol_of_vol_pts_day: 0.30
+      vol_mean_shift: 0.5
       skew_shift: 0.3
       corr_mult: [0.9, 1.3]
     risk_off:
-      drift: 0.0
-      rv_iv_ratio: [1.2, 1.7]
-      jump_intensity: 10
-      jump_size: 0.9
-      vol_of_vol: 1.6
+      drift_pct_session: 0.0
+      rv_iv_ratio: [1.20, 1.60]
+      jumps_per_session: 2.0
+      jump_size_pct: 0.9
+      vol_of_vol_pts_day: 0.80
       vol_mean_shift: 3.0
       skew_shift: 1.0
-      corr_mult: [1.2, 1.8]
+      corr_mult: [1.1, 1.6]
     cb_week:
-      drift: 0.0
-      rv_iv_ratio: [0.8, 1.1]
-      jump_intensity: 3
-      jump_size: 0.5
-      vol_of_vol: 1.0
+      drift_pct_session: 0.0
+      rv_iv_ratio: [0.80, 1.05]
+      jumps_per_session: 0.5
+      jump_size_pct: 0.5
+      vol_of_vol_pts_day: 0.35
       vol_mean_shift: 0.5
       skew_shift: 0.2
       corr_mult: [0.7, 1.2]
     intervention:
-      drift: 0.0
-      rv_iv_ratio: [1.0, 1.4]
-      jump_intensity: 5
-      jump_size: 0.7
-      vol_of_vol: 1.2
+      drift_pct_session: 1.5
+      rv_iv_ratio: [1.00, 1.30]
+      jumps_per_session: 0.8
+      jump_size_pct: 0.7
+      vol_of_vol_pts_day: 0.50
       vol_mean_shift: 1.5
       skew_shift: 0.6
       corr_mult: [0.5, 1.5]     # sometimes the usual correlation breaks down
+
+  # Scheduled events: currency, typical 1-sd surprise move (% of spot), name
+  events:
+    USD: [["US CPI", 0.55], ["FOMC decision", 0.8], ["US payrolls", 0.6]]
+    EUR: [["ECB decision", 0.6], ["Euro-area flash CPI", 0.35]]
+    JPY: [["BoJ decision", 1.0], ["Tokyo CPI", 0.35]]
+    GBP: [["BoE decision", 0.6], ["UK CPI", 0.45]]
+    AUD: [["RBA decision", 0.6], ["Australian jobs report", 0.45]]
+    NZD: [["RBNZ decision", 0.7]]
+    CAD: [["BoC decision", 0.5]]
+    CHF: [["SNB decision", 0.7]]
+  events_per_session: {calm: 2, trending: 2, risk_off: 2, cb_week: 5, intervention: 2}
 
   # Pair-specific spot/vol dynamics.
   # spot_vol_corr: corr between spot returns and ATM vol changes (base-currency view).
