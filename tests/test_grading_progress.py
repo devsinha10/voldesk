@@ -70,3 +70,22 @@ def test_mixed_review_pick(monkeypatch, tmpdb):
     qs = [po.generate("1A", s, 1) for s in range(5)]
     q = pick_weighted(qs, "options", np.random.default_rng(0))
     assert q in qs
+
+
+def test_grade_answer_with_mocked_api(monkeypatch, tmp_path):
+    import json as _json
+    calls = []
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    monkeypatch.setattr(llm, "load_config", lambda: {"llm": {"model": "m", "cache_db": str(tmp_path / "c.sqlite")}})
+    monkeypatch.setattr(llm, "data_path", lambda rel: tmp_path / "c.sqlite")
+
+    def fake_create(system, user, schema):
+        calls.append(user)
+        assert "ENGINE FACTS" in user and "<answer>" in user
+        return _json.dumps({"score": 12, "correct_points": ["a"], "missed_points": [], "errors": [],
+                            "model_answer": "x"})
+    monkeypatch.setattr(llm, "_create", fake_create)
+    r1 = llm.grade_answer("q", "my answer", {"vega": 1.0}, ["r"])
+    r2 = llm.grade_answer("q", "my answer", {"vega": 1.0}, ["r"])
+    assert r1["score"] == 10 and not r1["cached"]   # clipped to 0-10
+    assert r2["cached"] and len(calls) == 1          # second call served from cache

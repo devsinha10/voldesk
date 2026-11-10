@@ -42,9 +42,12 @@ def test_usdjpy_spot_vol_correlation_negative():
     rets, dvol = [], []
     for _ in range(400):
         s0, l0 = m.spot("USDJPY"), m.state["USDJPY"].level
-        m.step()
+        news = m.step()
+        if news or m.alphas:  # measure the diffusive relationship only
+            continue
         rets.append(np.log(m.spot("USDJPY") / s0))
         dvol.append(m.state["USDJPY"].level - l0)
+    assert m.state["USDJPY"].corr < 0
     assert np.corrcoef(rets, dvol)[0, 1] < -0.2
 
 
