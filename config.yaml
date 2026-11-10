@@ -7,8 +7,9 @@
 
 llm:
   model: claude-sonnet-5-5          # model used for marking and debriefs
-  max_tokens: 1500
-  temperature: 0.0
+  max_tokens: 16000
+  effort: medium                  # low | medium | high (marking needs care, not depth)
+  refusal_fallbacks: true         # server-side fallback model if a request is declined
   cache_db: data/llm_cache.sqlite
 
 storage:

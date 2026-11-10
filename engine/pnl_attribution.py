@@ -25,7 +25,9 @@ from typing import Iterable
 import numpy as np
 
 from engine.fx_pricer import greeks, price
-from engine.structures import Leg, SingleMarket, bucket_for
+from dataclasses import replace
+
+from engine.structures import Leg, SingleMarket, Structure, bucket_for
 
 GREEK_TERMS = ["delta", "gamma", "vega", "theta", "vanna", "volga", "rho"]
 
@@ -121,3 +123,25 @@ def attach_trading_terms(att: Attribution, edge: float = 0.0, hedge_cost: float 
     att.trading["carry"] = att.trading.get("carry", 0.0) + carry
     att.actual += edge + hedge_cost + carry
     return att
+
+
+def revaluation_breakdown(legs: Iterable[Leg], m0: SingleMarket, m1: SingleMarket) -> dict[str, float]:
+    """Exact, order-dependent breakdown for LARGE shocks (used in the drills).
+
+    Steps: spot moves (vols sticky by strike) -> vols/rates move -> time passes.
+    * delta  = initial delta x dS
+    * gamma  = rest of the spot-move P&L (gamma plus higher-order spot terms)
+    * vega   = vol/rate step (includes volga, vanna and rate effects)
+    * theta  = time step (includes charm and roll-down)
+    The terms sum exactly to the full-revaluation P&L.
+    """
+    legs = tuple(legs)
+    st = Structure("tmp", legs)
+    v0 = st.value(m0)
+    e0 = st.exposure(m0)
+    mA = replace(m0, spot=m1.spot)
+    mB = replace(m1, t=m0.t)
+    vA, vB, v1 = st.value(mA), st.value(mB), st.value(m1)
+    delta = e0.delta * (m1.spot - m0.spot)
+    return {"delta": delta, "gamma": (vA - v0) - delta, "vega": vB - vA, "theta": v1 - vB,
+            "total": v1 - v0}

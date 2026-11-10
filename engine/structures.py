@@ -292,12 +292,17 @@ def build(kind: str, mkt: SingleMarket, tenor: str | float, notional: float = 1.
     kc = lambda d: mkt.strike_for_delta(tau, abs(d))
     kp = lambda d: mkt.strike_for_delta(tau, -abs(d))
     L = lambda cp, K, n, lab="", exp=T: Leg("option", n, K, exp, cp, lab)
+    def itm_or_otm(cp: str, d: Optional[float]) -> float:
+        if d is None:
+            return atm
+        if d > 0.5:  # ITM: use the opposite wing's strike (a 75d call ~ the 25d put strike)
+            return kp(1 - d) if cp == "C" else kc(1 - d)
+        return kc(d) if cp == "C" else kp(d)
+
     if kind == "call":
-        K = atm if moneyness_delta is None else kc(moneyness_delta)
-        legs = (L("C", K, N, "call"),)
+        legs = (L("C", itm_or_otm("C", moneyness_delta), N, "call"),)
     elif kind == "put":
-        K = atm if moneyness_delta is None else kp(moneyness_delta)
-        legs = (L("P", K, N, "put"),)
+        legs = (L("P", itm_or_otm("P", moneyness_delta), N, "put"),)
     elif kind == "straddle":
         legs = (L("C", atm, N, "ATM call"), L("P", atm, N, "ATM put"))
     elif kind == "strangle":
