@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from grading.llm import api_available, grade_answer
-from grading.question import Question, combine_scores
+from grading.question import Question, combine_scores, fmt_given
 from progress import db
 
 PALETTE = ["#2E6FD8", "#E07A1F", "#2A9D6F", "#B8443A", "#7A5CC2"]
@@ -55,11 +55,15 @@ def question_page(key: str, section: str, subsections: dict[str, tuple[str, Call
     if review_pool is not None:
         labels.append("Mixed review (weakest topics)")
     choice = c1.selectbox("Section", labels, key=f"{key}_sub")
-    diff = c2.radio("Difficulty", [1, 2, 3], horizontal=True, key=f"{key}_diff")
+    diff = c2.radio("Level", [1, 2, 3], horizontal=True, key=f"{key}_diff",
+                    help="1 = direction and intuition, no calculations. 2 = combinations, light calculations with "
+                         "every input given. 3 = calculations plus subtler concepts.")
     c3.write("")
     new = c3.button("New question", type="primary", key=f"{key}_new", use_container_width=True)
 
     code = choice.split()[0]
+    if code in subsections:
+        level_strip(section, code)
     if code in locked:
         st.info(locked[code])
         return
@@ -79,10 +83,39 @@ def question_page(key: str, section: str, subsections: dict[str, tuple[str, Call
     render_question(q, key)
 
 
+def level_strip(section: str, code: str) -> None:
+    """Accuracy per level for this sub-section (last 20 questions) and the recommended level."""
+    stats = [x for x in db.level_stats(section) if x["subsection"] == code]
+    by = {x["level"]: x for x in stats}
+    rec = db.recommended_level(stats, section, code)
+    cells = []
+    for lvl in (1, 2, 3):
+        x = by.get(lvl)
+        if x is None:
+            cells.append(f"L{lvl}: no attempts")
+        else:
+            mark = " ✅ passed" if x["passed"] else ""
+            cells.append(f"L{lvl}: {x['accuracy']*100:.0f}% of last {x['window']}{mark}")
+    st.caption("  |  ".join(cells) + f"  |  Recommended: **Level {rec}** (pass = 80% over the last 20, a question "
+               f"counts as correct at 7/10+)")
+
+
+def render_givens(q: Question) -> None:
+    """The Givens box: every input a numeric part needs."""
+    if not q.givens:
+        return
+    with st.container(border=True):
+        st.markdown("**Givens**")
+        df = pd.DataFrame({"Given": [q.given_labels.get(k, k) for k in q.givens],
+                           "Value": [fmt_given(v) for v in q.givens.values()]})
+        st.dataframe(df, hide_index=True, use_container_width=True)
+
+
 def render_question(q: Question, key: str) -> None:
     ss = st.session_state
-    st.caption(f"Topic: `{q.topic}`   Difficulty {q.difficulty}   Seed {q.seed}")
+    st.caption(f"Topic: `{q.topic}`   Level {q.difficulty}   Seed {q.seed}")
     st.markdown(q.prompt)
+    render_givens(q)
     answers: dict[int, object] = {}
     disabled = bool(ss.get(f"{key}_submitted"))
     for i, p in enumerate(q.parts):
@@ -198,5 +231,5 @@ def _reveal(q: Question, key: str) -> None:
 def _log(q: Question, key: str, auto, llm, final, res) -> None:
     db.log_attempt(q.section, q.subsection, q.topic, q.difficulty, q.qid, final, auto, llm,
                    answer={"parts": res["answers"], "free": res["free"]}, feedback=res["graded"],
-                   template=q.template, seed=q.seed)
+                   template=q.template, seed=q.seed, version=q.version, coverage_cell=q.coverage_cell)
     st.session_state[f"{key}_logged"] = True

@@ -7,25 +7,26 @@ import numpy as np
 from engine.fx_conventions import TENORS
 from engine.pnl_attribution import revaluation_breakdown
 from engine.structures import build, describe
-from grading.question import Part, Question, chart_line
-from prep_options.common import (GREEK_LABEL, GREEK_UNITS, describe_position_change, fmt_greek, fmt_num,
-                                 fx_market, pick_pair, profile, spot_grid, spx_market, tenor_text)
+from grading.question import Part, Question, attach_givens, chart_line
+from prep_options.common import (GREEK_UNITS, describe_position_change, fmt_greek, fmt_num,
+                                 fx_market, pick_pair, profile, spot_grid, spx_market)
 
 ROW_KEYS_BASE = {"Delta": "delta", "Gamma": "gamma_1pct", "Theta": "theta", "Vega": "vega",
-            "Vanna": "vanna", "Volga": "volga"}
+                 "Vanna": "vanna", "Volga": "volga", "Charm": "charm"}
+GREEK_UNITS = dict(GREEK_UNITS)
 
-KINDS = {
-    1: ["call", "put", "straddle", "strangle"],
-    2: ["call", "put", "straddle", "strangle", "risk_reversal", "call_spread", "put_spread",
-        "butterfly", "collar"],
-    3: ["call", "put", "straddle", "strangle", "risk_reversal", "call_spread", "put_spread",
-        "butterfly", "collar", "calendar", "ratio_spread"],
-}
+STRUCTS = ["straddle", "strangle", "risk_reversal", "call_spread", "put_spread", "butterfly", "calendar",
+           "collar", "ratio_spread"]
+
+# Level 1: outright calls/puts. Level 2: structures (+ delta-hedged). Level 3: a mix, second-order rows,
+# combined shocks and a short P&L estimate from the Greeks given.
+KINDS = {1: ["call", "put"], 2: STRUCTS, 3: ["call", "put"] + STRUCTS}
+SINGLE = ["iv_spike", "iv_crush", "spot_rally", "spot_selloff", "time_passes", "approaching_expiry"]
 SHOCKS = {
-    1: ["iv_spike", "iv_crush", "spot_rally", "spot_selloff", "time_passes"],
-    2: ["iv_spike", "iv_crush", "spot_rally", "spot_selloff", "time_passes", "approaching_expiry"],
-    3: ["iv_spike", "iv_crush", "spot_rally", "spot_selloff", "time_passes", "approaching_expiry",
-        "skew_steepen", "term_invert"],
+    1: SINGLE,
+    2: SINGLE + ["skew_steepen", "term_invert"],
+    3: ["spot_selloff+skew_steepen", "spot_rally+iv_spike", "time_passes+iv_crush", "spot_rally+iv_crush",
+        "spot_selloff+iv_spike", "approaching_expiry+spot_rally", "spot_rally+term_invert"],
 }
 
 SHOCK_MECH = {
@@ -69,6 +70,15 @@ SHOCK_MECH = {
 
 
 def _apply_shock(rng, mkt, shock: str, tau: float, legs_expiry_min: float):
+    if "+" in shock:
+        a, b = shock.split("+")
+        m1, t1, k1 = _apply_single(rng, mkt, a, tau, legs_expiry_min)
+        m2, t2, k2 = _apply_single(rng, m1, b, tau, max(legs_expiry_min - (m1.t - mkt.t), 1 / 365))
+        return m2, f"{t1}, and {t2}", f"{k1}+{k2}"
+    return _apply_single(rng, mkt, shock, tau, legs_expiry_min)
+
+
+def _apply_single(rng, mkt, shock: str, tau: float, legs_expiry_min: float):
     v0 = mkt.vol(mkt.forward(tau), tau)
     if shock == "iv_spike":
         pts = round(float(rng.uniform(2.0, 6.0)) * max(v0 / 0.08, 0.7), 1)
@@ -87,7 +97,7 @@ def _apply_shock(rng, mkt, shock: str, tau: float, legs_expiry_min: float):
         return mkt.pass_time(days), f"{days:.0f} days pass with spot and vols unchanged", "time"
     if shock == "approaching_expiry":
         days = max(legs_expiry_min * 365 - 2, 1)
-        return mkt.pass_time(days), f"time passes until 2 days are left to the (nearest) expiry, spot and vols unchanged", "time"
+        return mkt.pass_time(days), "time passes until 2 days are left to the (nearest) expiry, spot and vols unchanged", "time"
     if shock == "skew_steepen":
         pts = round(float(rng.uniform(1.0, 3.0)), 1)
         return mkt.bump_skew(-pts), f"the skew steepens: 25d risk reversals move {pts:.1f} vols further towards puts", "skew_steepen"
@@ -110,20 +120,22 @@ def generate(seed: int, difficulty: int) -> Question:
         N = float(rng.choice([10e6, 25e6, 50e6]))
         name = pair
     kind = str(rng.choice(KINDS[difficulty]))
+    if difficulty == 3 and kind in ("call", "put") and rng.random() < 0.3:
+        kind = str(rng.choice(STRUCTS))  # level 3 leans towards structures
     side = int(rng.choice([1, -1]))
     tenor = str(rng.choice(["1M", "3M"] if difficulty == 1 else ["1W", "1M", "3M", "6M", "1Y"]))
     if kind == "calendar":
         tenor = str(rng.choice(["1W", "1M"]))
-    hedged = difficulty >= 2 and kind not in ("collar", "straddle") and rng.random() < 0.35
+    hedged = difficulty >= 2 and kind not in ("collar", "straddle", "call", "put") and rng.random() < 0.35
     md = None
-    if kind in ("call", "put") and difficulty >= 2 and rng.random() < 0.5:
-        md = float(rng.choice([0.25, 0.75]))
+    if kind in ("call", "put") and rng.random() < 0.6:
+        md = float(rng.choice([0.25, 0.75, 0.10]))
     struct = build(kind, mkt, tenor, N, side=side, moneyness_delta=md, hedged=hedged)
     shock = str(rng.choice(SHOCKS[difficulty]))
     tau = TENORS[tenor]
     exp_min = min(l.expiry for l in struct.legs if l.kind == "option") - mkt.t
     m1, shock_text, mech_key = _apply_shock(rng, mkt, shock, tau, exp_min)
-    rows = ["Delta", "Gamma", "Theta", "Vega"] + (["Vanna", "Volga"] if difficulty == 3 else [])
+    rows = ["Delta", "Gamma", "Theta", "Vega"] + (["Vanna", "Volga", "Charm"] if difficulty == 3 else [])
     ROW_KEYS = dict(ROW_KEYS_BASE)
     if mkt.premium_adjusted:
         ROW_KEYS["Delta"] = "delta_pa"  # market convention for this pair
@@ -133,7 +145,7 @@ def generate(seed: int, difficulty: int) -> Question:
     ref_atm = build("call", mkt, tenor, N).exposure(mkt)
     ref_25 = build("call", mkt, tenor, N, moneyness_delta=0.25).exposure(mkt)
     refs = {"delta": N, "delta_pa": N, "gamma_1pct": ref_atm.gamma_1pct, "theta": ref_atm.theta, "vega": ref_atm.vega,
-            "vanna": ref_25.vanna, "volga": ref_25.volga}
+            "vanna": ref_25.vanna, "volga": ref_25.volga, "charm": ref_25.charm}
     correct = {}
     for r in rows:
         k = ROW_KEYS[r]
@@ -170,10 +182,11 @@ def generate(seed: int, difficulty: int) -> Question:
     intuition = _structure_intuition(kind, side, hedged)
     lines += ["", f"**Intuition for the structure:** {intuition}", "",
               f"**After the shock ({shock_text}):**"]
-    for r in ["Delta", "Gamma", "Theta", "Vega"] + (["Vanna", "Volga"] if difficulty == 3 else []):
+    for r in rows:
         k = ROW_KEYS[r]
+        mt = _mech(mech_key, k.replace("_pa", ""))
         lines.append("- " + describe_position_change(r.lower(), getattr(e0, k), getattr(e1, k), fmtk(k)) +
-                     (f". {SHOCK_MECH[mech_key][k.replace('_pa', '')]}" if k.replace('_pa', '') in SHOCK_MECH[mech_key] else ""))
+                     (f". {mt}" if mt else ""))
     lines += ["", f"**P&L from the shock:** {fmt_num(pnl)} {mkt.pair.quote if mkt.pair else 'USD'} by full revaluation. "
               f"Breakdown (spot, then vol, then time): delta {fmt_num(terms['delta'])}, gamma and higher-order "
               f"spot {fmt_num(terms['gamma'])}, vega/vol {fmt_num(terms['vega'])}, theta {fmt_num(terms['theta'])}. "
@@ -186,23 +199,23 @@ def generate(seed: int, difficulty: int) -> Question:
         "structure": desc, "notional_per_leg": N, "underlying": name, "spot": mkt.spot,
         "legs": [{"type": l.kind, "cp": l.cp, "K": l.K, "notional": l.notional, "label": l.label} for l in struct.legs],
         "shock": shock_text,
-        "before": {r: getattr(e0, ROW_KEYS[r]) for r in ["Delta", "Gamma", "Theta", "Vega", "Vanna", "Volga"]},
-        "after": {r: getattr(e1, ROW_KEYS[r]) for r in ["Delta", "Gamma", "Theta", "Vega", "Vanna", "Volga"]},
+        "before": {r: getattr(e0, ROW_KEYS[r]) for r in ROW_KEYS},
+        "after": {r: getattr(e1, ROW_KEYS[r]) for r in ROW_KEYS},
         "units": {r: GREEK_UNITS[ROW_KEYS[r]] for r in ROW_KEYS},
         "delta_convention": "premium-adjusted" if mkt.premium_adjusted else "unadjusted spot delta",
         "correct_signs_before": correct, "shock_pnl_total": pnl, "shock_pnl_breakdown": terms,
         "largest_pnl_driver": main,
     }
-    rubric = [f"Before-shock signs: " + ", ".join(f"{r} {correct[r] if isinstance(correct[r], str) else correct[r][0]}" for r in rows),
+    rubric = ["Before-shock signs: " + ", ".join(f"{r} {correct[r] if isinstance(correct[r], str) else correct[r][0]}" for r in rows),
               f"P&L from the shock is {'positive' if pnl > 0 else 'negative'}, driven mainly by {main}",
               "Gamma change: " + describe_position_change("gamma", e0.gamma_1pct, e1.gamma_1pct, fmtk("gamma_1pct")),
               "Vega change: " + describe_position_change("vega", e0.vega, e1.vega, fmtk("vega")),
               "Theta change: " + describe_position_change("theta", e0.theta, e1.theta, fmtk("theta")),
               "Delta change: " + describe_position_change("delta", getattr(e0, ROW_KEYS["Delta"]), getattr(e1, ROW_KEYS["Delta"]), fmtk(ROW_KEYS["Delta"])),
-              "Mechanism for the shock: " + SHOCK_MECH[mech_key]["gamma_1pct"]]
+              "Mechanism for the shock: " + _mech(mech_key, "gamma_1pct")]
 
     spots = spot_grid(mkt, exp_min if exp_min > 0 else tau)
-    m1_curve = m1 if mech_key != "spot_move" else mkt
+    m1_curve = m1
     charts = [
         chart_line("Position value vs spot", spots,
                    {"Before shock": profile(struct, mkt, "value", spots),
@@ -220,13 +233,55 @@ def generate(seed: int, difficulty: int) -> Question:
     table = {"title": "Exposures before and after (engine)", "columns": ["Greek", "Units", "Before", "After"],
              "rows": [[r, GREEK_UNITS[ROW_KEYS[r]], fmt_greek(mkt, ROW_KEYS[r], getattr(e0, ROW_KEYS[r])),
                        fmt_greek(mkt, ROW_KEYS[r], getattr(e1, ROW_KEYS[r]))]
-                      for r in ["Delta", "Gamma", "Theta", "Vega", "Vanna", "Volga"]]}
-    return Question(section="options", subsection="1B", topic=f"exposures:{kind}", difficulty=difficulty,
-                    template="exposures", seed=seed, prompt=prompt,
-                    parts=[Part("sign_table", "Exposure signs before the shock", rows=rows, correct=correct, weight=1.0)],
-                    free_text_prompt=f"How do your exposures change if {shock_text}? What happens to your P&L, and why?",
-                    facts=facts, model_answer=model, rubric=rubric, charts=charts, tables=[table],
-                    tags=[kind, shock, "equity" if equity else "fx"])
+                      for r in ROW_KEYS]}
+    q = Question(section="options", subsection="1B", topic=f"exposures:{kind}", difficulty=difficulty,
+                 template=f"exposures_L{difficulty}", seed=seed, prompt=prompt,
+                 parts=[Part("sign_table", "Exposure signs before the shock", rows=rows, correct=correct, weight=1.0)],
+                 free_text_prompt=f"How do your exposures change if {shock_text}? What happens to your P&L, and why?",
+                 facts=facts, model_answer=model, rubric=rubric, charts=charts, tables=[table],
+                 tags=[kind, shock, "equity" if equity else "fx"])
+    if difficulty == 3:
+        _add_pnl_estimate(q, rng, struct, mkt, e0)
+    return q
+
+
+def _mech(key: str, greek: str) -> str:
+    return " ".join(SHOCK_MECH[k][greek] for k in key.split("+") if greek in SHOCK_MECH.get(k, {}))
+
+
+def _add_pnl_estimate(q: Question, rng, struct, mkt, e0) -> None:
+    """Level 3: one or two numeric steps, every input in the Givens box."""
+    x = round(float(rng.choice([-1.5, -1.0, -0.5, 0.5, 1.0, 1.5])), 1)
+    dv = round(float(rng.choice([-2.0, -1.0, 1.0, 2.0, 3.0])), 1)
+    ccy_q = mkt.pair.quote if mkt.pair else "USD"
+    ccy_b = mkt.pair.base if mkt.pair else "units"
+    givens = {"S": round(mkt.spot, 5), "delta": round(e0.delta, 0), "gamma_1pct": round(e0.gamma_1pct, 0),
+              "vega": round(e0.vega, 0), "spot_move_pct": x, "vol_move_pts": dv}
+    labels = {"S": "Spot", "delta": f"Delta ({ccy_b}, unadjusted spot delta)",
+              "gamma_1pct": f"Gamma ({ccy_b} delta change per 1% spot)", "vega": f"Vega ({ccy_q} per vol pt)",
+              "spot_move_pct": "Spot move (%)", "vol_move_pts": "Vol move (pts, parallel)"}
+
+    def solver(g):
+        dS = g["S"] * g["spot_move_pct"] / 100
+        return [g["delta"] * dS + 0.5 * g["gamma_1pct"] * g["spot_move_pct"] * dS + g["vega"] * g["vol_move_pts"]]
+
+    q.parts.append(Part("numeric", f"Estimated instant P&L ({ccy_q}) for spot {x:+}% and vol {dv:+} pts",
+                        tol_rel=0.05, tol_abs=abs(givens["vega"]) * 0.05 + 1))
+    q.prompt += (f"\n\n3. Using only the Greeks in the Givens box, estimate the instant P&L if spot moves "
+                 f"**{x:+}%** and vols move **{dv:+} pts** in parallel.")
+    attach_givens(q, givens, labels, solver)
+    est = q.parts[-1].correct
+    exact = struct.value(mkt.bump_spot(x).bump_vol(dv)) - struct.value(mkt)
+    dS = givens["S"] * x / 100
+    q.model_answer += (f"\n\n**P&L estimate (part 3): {fmt_num(est)} {ccy_q}.**\n"
+                       f"- Delta: {givens['delta']:,.0f} x dS ({dS:+.5g}) = {givens['delta'] * dS:,.0f}\n"
+                       f"- Gamma: 0.5 x {givens['gamma_1pct']:,.0f} x {x} x dS = {0.5 * givens['gamma_1pct'] * x * dS:,.0f}\n"
+                       f"- Vega: {givens['vega']:,.0f} x {dv} = {givens['vega'] * dv:,.0f}\n"
+                       f"- Engine full revaluation: {fmt_num(exact)} {ccy_q}. The gap ({fmt_num(exact - est)}) is "
+                       f"vanna (spot and vol moving together), volga, and gamma changing over the move (speed), which "
+                       f"is large for short-dated options near their strikes.")
+    q.facts["pnl_estimate_inputs"] = givens
+    q.facts["pnl_estimate_engine_exact"] = exact
 
 
 def _structure_intuition(kind: str, side: int, hedged: bool) -> str:

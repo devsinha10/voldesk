@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
+
+QUESTION_VERSION = 2   # v2 = re-tiered levels with Givens boxes
 
 DIRECTIONS = ["Up", "Down", "Unchanged"]
 SIGNS = ["+", "-", "0"]
@@ -67,7 +70,9 @@ class Part:
         if self.kind == "mcq":
             return str(self.options[self.correct])
         if self.kind == "numeric":
-            return f"{self.correct:,.4g} {self.unit}".strip()
+            x = float(self.correct)
+            v = f"{x:,.0f}" if abs(x) >= 1000 else f"{x:,.2f}" if abs(x) >= 1 else f"{x:.4g}"
+            return f"{v} {self.unit}".strip()
         if self.kind == "sign_table":
             fmt = lambda c: "/".join(c) if isinstance(c, (list, tuple, set)) else c
             return ", ".join(f"{r}: {fmt(self.correct[r])}" for r in self.rows)
@@ -93,6 +98,13 @@ class Question:
     charts: list[dict] = field(default_factory=list)
     tables: list[dict] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    # every input a numeric part needs: key -> value, key -> "label (unit)"
+    givens: dict = field(default_factory=dict)
+    given_labels: dict = field(default_factory=dict)
+    # solver(givens) -> list of answers, one per numeric part, in order. Uses ONLY givens.
+    solver: Optional[Callable[[Mapping], list]] = None
+    coverage_cell: Optional[tuple] = None   # (matrix, cell) for the 1A coverage matrices
+    version: int = QUESTION_VERSION
 
     @property
     def qid(self) -> str:
@@ -107,7 +119,71 @@ class Question:
         return 10.0 * sum(p.weight * p.mark(answers.get(i)) for i, p in enumerate(self.parts)) / w
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), default=str)
+        d = {k: v for k, v in self.__dict__.items() if k != "solver"}
+        d["parts"] = [asdict(p) for p in self.parts]
+        return json.dumps(d, default=str)
+
+    def numeric_parts(self) -> list["Part"]:
+        return [p for p in self.parts if p.kind == "numeric"]
+
+
+def fmt_given(v: Any) -> str:
+    """Display format for a given value."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (list, tuple)):
+        return ", ".join(fmt_given(x) for x in v)
+    v = float(v)
+    a = abs(v)
+    if a == 0:
+        return "0"
+    if v.is_integer():
+        return f"{v:,.0f}"
+    if a >= 1e6:
+        return f"{v:,.0f}"
+    if a >= 100:
+        return f"{v:,.2f}"
+    if a >= 1:
+        return f"{v:,.4f}".rstrip("0").rstrip(".")
+    return f"{v:.6g}"
+
+
+def render_givens(q: Question) -> str:
+    """Markdown table of every given (what the UI shows in the Givens box)."""
+    if not q.givens:
+        return ""
+    rows = [f"| {q.given_labels.get(k, k)} | {fmt_given(v)} |" for k, v in q.givens.items()]
+    return "| Given | Value |\n|---|---|\n" + "\n".join(rows)
+
+
+class RecordingMapping(Mapping):
+    """Read-only view of the givens that records which keys a solver reads."""
+
+    def __init__(self, data: dict) -> None:
+        self._d = dict(data)
+        self.used: set = set()
+
+    def __getitem__(self, k):
+        self.used.add(k)
+        return self._d[k]
+
+    def __iter__(self) -> Iterator:
+        return iter(self._d)
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+
+def attach_givens(q: Question, givens: dict, labels: dict, solver: Callable[[Mapping], list]) -> Question:
+    """Attach givens + solver and set every numeric part's answer from solver(givens)."""
+    q.givens, q.given_labels, q.solver = dict(givens), dict(labels), solver
+    answers = list(solver(RecordingMapping(givens)))
+    nparts = q.numeric_parts()
+    if len(answers) != len(nparts):
+        raise ValueError(f"{q.template}: solver returned {len(answers)} answers for {len(nparts)} numeric parts")
+    for p, a in zip(nparts, answers):
+        p.correct = float(a)
+    return q
 
 
 def combine_scores(auto: Optional[float], llm: Optional[float], auto_weight: float = 0.5) -> float:

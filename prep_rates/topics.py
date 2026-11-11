@@ -1,414 +1,612 @@
-"""Sections 2B-2F: convexity, curve trades, carry/roll, central-bank pricing, advanced."""
+"""Sections 2B-2F, each tiered:
+L1 intuition only, L2 light calculations with full Givens, L3 multi-step / advanced with full Givens."""
 from __future__ import annotations
 
 import numpy as np
 
 from engine.config import load_config
-from engine.rates import (BP, ZeroCurve, bond_risk, ctd_analysis, implied_move_probability, key_rate_dv01s,
-                          par_swap_rate, receiver_carry_rolldown)
-from grading.question import Part, Question, chart_bar, chart_line
-from prep_rates.instruments import (Bond, Composite, Swap, Swaption, base_curve, callable_bond, fmt_ccy,
+from engine.rates import annuity, bond_risk, ctd_analysis, key_rate_dv01s, par_swap_rate
+from grading.question import attach_givens, chart_bar
+from prep_rates.instruments import (Bond, Composite, Swap, Swaption, ZeroCurve, base_curve, fmt_ccy,
                                     move_curve, pnl, risk)
+from prep_rates.qkit import GAIN_LOSE, LONG_SHORT, Q, dv01_gamma, mcq, num, shuffle_opts
 
 CFG = load_config()["rates_engine"]
 NVOL = CFG["swaption_normal_vol_bp"] / 1e4
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # 2B Convexity
-# ---------------------------------------------------------------------------
-def b_barbell(rng, d, seed):
-    c = base_curve()
-    s, l, m = 2, 30, 10
-    bullet = Bond(0.0, m, 100e6)
+# =============================================================================
+def _barbell(c):
+    bullet = Bond(0.0, 10, 100e6)
     rb = risk(bullet, c)
-    short, long_ = Bond(0.0, s, 1.0), Bond(0.0, l, 1.0)
-    # solve weights: same PV and same DV01 as the bullet
-    A = np.array([[short.pv(c), long_.pv(c)], [risk(short, c).dv01, risk(long_, c).dv01]])
+    s, l = Bond(0.0, 2, 1.0), Bond(0.0, 30, 1.0)
+    A = np.array([[s.pv(c), l.pv(c)], [risk(s, c).dv01, risk(l, c).dv01]])
     w = np.linalg.solve(A, np.array([rb.pv, rb.dv01]))
-    barbell = Composite([Bond(0.0, s, w[0]), Bond(0.0, l, w[1])])
-    bp = int(rng.choice([75, 100, 150]))
-    diff_dn = pnl(barbell, c, c.shifted(-bp)) - pnl(bullet, c, c.shifted(-bp))
-    diff_up = pnl(barbell, c, c.shifted(bp)) - pnl(bullet, c, c.shifted(bp))
-    y_bullet = float(c.zero(m))
-    y_bar = float((w[0] * short.pv(c) * c.zero(s) * s + w[1] * long_.pv(c) * c.zero(l) * l) /
-                  (w[0] * short.pv(c) * s + w[1] * long_.pv(c) * l))
-    moves = np.arange(-150, 151, 25)
-    model = (f"**The barbell outperforms in both directions: {fmt_ccy(diff_dn)} if yields fall {bp}bp, "
-             f"{fmt_ccy(diff_up)} if they rise {bp}bp.**\n\n"
-             f"1. Same PV and duration, but the barbell spreads its cash flows out (2y and 30y), and convexity grows "
-             f"roughly with maturity squared, so the 30y wing adds far more convexity than the 2y wing gives up.\n"
-             f"2. Convexity P&L (+/-25bp): barbell {fmt_ccy(risk(barbell, c).convexity_pnl)} vs bullet "
-             f"{fmt_ccy(rb.convexity_pnl)}.\n"
-             f"3. You pay for it: in a fair market the extra convexity costs yield. Here the duration-weighted yield of "
-             f"the barbell is {y_bar*100:.2f}% vs {y_bullet*100:.2f}% for the bullet. The barbell is also SHORT the "
-             f"belly versus the wings: if the 10y richens relative to 2y/30y (non-parallel move) it loses.\n"
-             f"4. Same trade-off as gamma vs theta in options.")
-    return Question("rates", "2B", "convexity:barbell", d, "b_barbell", seed,
-                    prompt=(f"Compare GBP 100m PV of a 10y zero (bullet) with a 2y/30y zero barbell of the **same PV and DV01**. "
-                            f"Yields move {bp}bp in parallel, up or down. Which does better, and by how much if yields fall?"),
-                    parts=[Part("mcq", "Better in a big move", ["Barbell, in either direction", "Bullet, in either direction",
-                                                                "Barbell if yields fall, bullet if they rise"], 0),
-                           Part("numeric", f"Barbell minus bullet P&L if yields fall {bp}bp (GBP k)",
-                                correct=diff_dn / 1e3, tol_abs=max(5.0, 0.15 * abs(diff_dn / 1e3)))],
-                    free_text_prompt="What do you give up for that convexity?",
-                    facts={"weights_2y_30y_face": list(map(float, w)), "diff_down": diff_dn, "diff_up": diff_up,
-                           "yield_barbell": y_bar, "yield_bullet": y_bullet}, model_answer=model,
-                    rubric=["Barbell has more convexity", "Gains in big moves both ways", "Costs yield / carry",
-                            "Exposed to belly vs wings (curve shape)"],
-                    charts=[chart_line("Barbell minus bullet P&L", moves,
-                                       {"Barbell - bullet": [pnl(barbell, c, c.shifted(x)) - pnl(bullet, c, c.shifted(x)) for x in moves]},
-                                       "Parallel move (bp)", "GBP", vline=0)])
+    return bullet, Composite([Bond(0.0, 2, w[0]), Bond(0.0, 30, w[1])]), w
 
 
-def b_maturity_squared(rng, d, seed):
+def b_l1_barbell(rng, lvl, seed):
+    opts = ["The barbell, in either direction", "The bullet, in either direction", "The barbell only if yields fall"]
+    return Q("2B", "convexity:barbell", lvl, "b_l1_barbell", seed,
+             "A 10Y zero (bullet) vs a 2Y/30Y zero barbell with the **same PV and DV01**. Yields jump 100bp, up or down. "
+             "Which does better? What do you give up for that?",
+             [mcq("Better in a big parallel move", opts, 0)], "Explain, including the cost.",
+             "**The barbell, both ways.**\n\n1. Same duration, but the barbell's cash flows are spread out, and convexity "
+             "grows roughly with maturity squared: the 30Y wing adds far more convexity than the 2Y wing loses.\n"
+             "2. You pay for it: lower yield/carry in a fair market, and the barbell is SHORT the belly vs the wings, so it "
+             "loses if the 10Y richens relative to 2Y and 30Y.\n3. Same trade-off as gamma vs theta.",
+             ["Barbell has more convexity", "Costs yield/carry", "Exposed to belly vs wings"])
+
+
+def b_l1_mortgage(rng, lvl, seed):
+    opts, corr = shuffle_opts(rng, "Receive fixed / buy duration, pushing yields lower still",
+                              ["Pay fixed / sell duration, pushing yields back up", "Nothing: MBS duration does not depend on rates"])
+    return Q("2B", "convexity:mortgage", lvl, "b_l1_mbs", seed,
+             "Rates rally hard. What do MBS holders who hedge their duration do, and what does it do to the market?",
+             [mcq("Hedging flow", opts, corr)], "Explain the chain.",
+             "**They buy duration.** MBS holders are short the borrowers' prepayment option: as rates fall, borrowers "
+             "refinance, the MBS shortens (negative convexity), so hedgers must receive fixed or buy long bonds to get "
+             "duration back. That flow chases the move and amplifies it.",
+             ["Prepayments shorten duration in a rally", "Hedgers buy duration", "Amplifies the move"])
+
+
+def b_l1_cost(rng, lvl, seed):
+    opts, corr = shuffle_opts(rng, "Premium or lower yield/carry: you pay for convexity like you pay theta for gamma",
+                              ["Nothing: convexity is free", "Higher duration", "Higher credit risk"])
+    return Q("2B", "convexity:cost", lvl, "b_l1_cost", seed,
+             "You add long convexity to a rates book (buy a swaption straddle, or swap a bullet for a barbell). What do you "
+             "pay for it?", [mcq("Cost", opts, corr)], "Explain the analogy with options.",
+             "**You pay premium or give up yield.** Long convexity gains from big moves either way, so the market charges "
+             "for it: option premium decays (theta), or the higher-convexity bond yields less. If rates sit still, you bleed.",
+             ["Convexity has a cost", "Gamma/theta analogy"])
+
+
+def b_l2_maturity(rng, lvl, seed):
+    t1, t2 = [(5, 10), (5, 20), (10, 30), (2, 10)][int(rng.integers(4))]
     y = 0.04
-    t1, t2 = rng.choice([(5, 10), (5, 20), (10, 30), (2, 10)])
-    t1, t2 = int(t1), int(t2)
-    c1, c2 = bond_risk(y, 0.0, t1, 1).convexity, bond_risk(y, 0.0, t2, 1).convexity
-    ratio = c2 / c1
-    model = (f"**About {ratio:.1f}x.**\n\n1. Convexity measures how much duration changes as yields move. For a zero, "
-             f"convexity = T(T+1)/(1+y)^2, roughly maturity squared.\n2. Engine: {t1}y zero {c1:.1f}, {t2}y zero "
-             f"{c2:.1f}; ratio {ratio:.2f} (maturity-squared rule gives {(t2/t1)**2:.1f}).\n3. Desk takeaway: "
-             f"convexity lives at the long end; 30y paper is where long-convexity demand (and mortgage hedging "
-             f"flows) bites hardest.")
-    return Question("rates", "2B", "convexity:maturity", d, "b_mat2", seed,
-                    prompt=f"Roughly how many times more convexity does a {t2}y zero-coupon bond have than a {t1}y zero (yield 4%)?",
-                    parts=[Part("numeric", "Ratio", correct=ratio, tol_rel=0.15, unit="x")],
-                    free_text_prompt="Explain the scaling.", facts={"c1": c1, "c2": c2, "ratio": ratio},
-                    model_answer=model, rubric=["Convexity ~ T^2", f"Ratio about {ratio:.1f}"])
+    g = {"T1": t1, "T2": t2, "y_pct": 4.0}
+    labels = {"T1": "Maturity of zero A (years)", "T2": "Maturity of zero B (years)", "y_pct": "Yield (%, annual comp.)"}
+    solver = lambda gv: [(gv["T2"] * (gv["T2"] + 1)) / (gv["T1"] * (gv["T1"] + 1))]
+    q = Q("2B", "convexity:maturity", lvl, "b_l2_maturity", seed,
+          f"For an annual zero, convexity = T(T+1)/(1+y)^2. How many times more convexity does the {t2}Y zero have than "
+          f"the {t1}Y zero?", [num("Ratio", "x", tol_rel=0.02)], "Explain the scaling.", "",
+          ["Convexity ~ T^2", "The (1+y)^2 cancels in the ratio"])
+    attach_givens(q, g, labels, solver)
+    r = q.parts[0].correct
+    q.model_answer = (f"**{r:.2f}x.** The (1+y)^2 terms cancel: {t2}x{t2+1} / ({t1}x{t1+1}) = {r:.2f}. Engine check: "
+                      f"{bond_risk(y, 0, t2, 1).convexity:.1f} vs {bond_risk(y, 0, t1, 1).convexity:.1f}. Convexity lives at the long end.")
+    return q
 
 
-def b_long_convexity_cost(rng, d, seed):
-    c = base_curve()
-    F = par_swap_rate(c, 1, 11)
-    straddle = Composite([Swaption(1, 10, F, NVOL, "payer", 100e6), Swaption(1, 10, F, NVOL, "receiver", 100e6)])
-    prem = straddle.pv(c)
-    from engine.rates import annuity
-    A_fwd = annuity(c, 1, 11) * 100e6
-    be = prem / A_fwd / BP
-    model = (f"**You need the 10y swap rate (1y forward) to move about {be:.0f}bp either way by expiry.**\n\n"
-             f"1. A swaption straddle is pure long convexity: it gains from big moves in either direction.\n"
-             f"2. You pay for it up front: premium {fmt_ccy(prem)}. At expiry the payoff is about "
-             f"annuity x |move|, with annuity PV ~ {fmt_ccy(A_fwd*BP)} per bp.\n3. Breakeven = premium / (annuity per bp) "
-             f"= {be:.0f}bp. With {NVOL*1e4:.0f}bp normal vol, the expected absolute move over 1y is about "
-             f"{NVOL*1e4*0.798:.0f}bp (0.8 x sigma).\n4. Same as options: long gamma costs theta; long convexity "
-             f"costs carry or yield.")
-    return Question("rates", "2B", "convexity:cost", d, "b_cost", seed,
-                    prompt=(f"You buy GBP 100m of a 1y-into-10y ATM swaption straddle (payer + receiver) at {NVOL*1e4:.0f}bp "
-                            f"normal vol. Roughly how far must rates move by expiry (bp, either way) to break even?"),
-                    parts=[Part("numeric", "Breakeven move (bp)", correct=be, tol_rel=0.1, unit="bp")],
-                    free_text_prompt="How is this like gamma vs theta?",
-                    facts={"premium": prem, "annuity_per_bp": A_fwd * BP, "breakeven_bp": be, "normal_vol_bp": NVOL * 1e4},
-                    model_answer=model, rubric=["Long convexity costs premium", "Breakeven = premium / annuity", "Gamma-theta analogy"])
+def b_l2_barbell(rng, lvl, seed):
+    c = base_curve(); bullet, bar, w = _barbell(c); bp = int(rng.choice([75, 100, 150]))
+    pv = bullet.pv(c)
+    cb = 0.5 * (pnl(bullet, c, c.shifted(25)) + pnl(bullet, c, c.shifted(-25))) / (pv * (25e-4) ** 2)
+    cbar = 0.5 * (pnl(bar, c, c.shifted(25)) + pnl(bar, c, c.shifted(-25))) / (pv * (25e-4) ** 2)
+    g = {"pv": round(pv, 0), "convexity_bullet": round(2 * cb, 2), "convexity_barbell": round(2 * cbar, 2), "dy_bp": bp}
+    labels = {"pv": "PV of each portfolio (GBP)", "convexity_bullet": "Bullet convexity (years^2)",
+              "convexity_barbell": "Barbell convexity (years^2)", "dy_bp": "Parallel move (bp, either way)"}
+    solver = lambda gv: [0.5 * (gv["convexity_barbell"] - gv["convexity_bullet"]) * gv["pv"] * (gv["dy_bp"] * 1e-4) ** 2 / 1e3]
+    q = Q("2B", "convexity:barbell", lvl, "b_l2_barbell", seed,
+          f"Bullet vs barbell with the same PV and duration (Givens). Estimate how much more the barbell makes than the "
+          f"bullet if yields move {bp}bp in either direction.", [num("Barbell minus bullet (GBP k)", "k", tol_rel=0.05, tol_abs=2)],
+          "What do you give up for it?", "", ["Duration terms cancel", "0.5 (C_bar - C_bul) PV dy^2", "Costs yield / curve risk"])
+    attach_givens(q, g, labels, solver)
+    exact = pnl(bar, c, c.shifted(-bp)) - pnl(bullet, c, c.shifted(-bp))
+    q.model_answer = (f"**About {fmt_ccy(q.parts[0].correct * 1e3)}.**\n\n1. Equal duration, so the duration terms cancel; "
+                      f"only convexity is left: 0.5 x (C_barbell - C_bullet) x PV x dy^2.\n2. Exact (engine, -{bp}bp): "
+                      f"{fmt_ccy(exact)}.\n3. The cost: lower yield, and exposure to the belly richening vs the wings.")
+    return q
 
 
-def b_mortgage(rng, d, seed):
-    c = base_curve()
-    cb = callable_bond(0.045, 10, 2, 100e6, NVOL, c)
-    r0, r1 = risk(cb, c), risk(cb, c.shifted(-50))
-    opts = ["Receive fixed / buy duration, which pushes yields lower still",
-            "Pay fixed / sell duration, which pushes yields back up",
-            "Nothing: MBS duration does not depend on rates"]
-    model = (f"**{opts[0]}.**\n\n1. Mortgage holders are short the borrower's prepayment option: when rates fall, "
-             f"borrowers refinance, the bond pays back early and its duration SHORTENS (negative convexity).\n"
-             f"2. Engine (callable bond proxy): DV01 {fmt_ccy(r0.dv01)} now, {fmt_ccy(r1.dv01)} after rates fall 50bp.\n"
-             f"3. Investors who target a duration must buy duration back (receive fixed, buy long bonds) as rates fall, "
-             f"and sell as rates rise. That flow chases the market and amplifies moves: 'convexity hedging'.")
-    return Question("rates", "2B", "convexity:mortgage", d, "b_mbs", seed,
-                    prompt="Rates rally hard. What do MBS holders who hedge their duration do, and what does that do to the market?",
-                    parts=[Part("mcq", "Hedging flow", opts, 0)], free_text_prompt="Explain the chain.",
-                    facts={"dv01_now": r0.dv01, "dv01_after_rally": r1.dv01}, model_answer=model,
-                    rubric=["Prepayment shortens duration as rates fall", "Hedgers buy duration", "Amplifies the move"])
+def b_l3_straddle(rng, lvl, seed):
+    c = base_curve(); F = par_swap_rate(c, 1, 11)
+    st = Composite([Swaption(1, 10, F, NVOL, "payer", 100e6), Swaption(1, 10, F, NVOL, "receiver", 100e6)])
+    rv = float(rng.choice([55, 65, 75, 95, 110]))
+    g = {"premium": round(st.pv(c), 0), "annuity_pv_per_bp": round(annuity(c, 1, 11) * 100e6 * 1e-4, 0),
+         "realised_vol_bp": rv}
+    labels = {"premium": "Straddle premium (GBP)", "annuity_pv_per_bp": "Forward annuity PV per bp (GBP)",
+              "realised_vol_bp": "Realised normal vol of the forward rate over the year (bp)"}
+    solver = lambda gv: [gv["premium"] / gv["annuity_pv_per_bp"],
+                         (0.7979 * gv["realised_vol_bp"] * gv["annuity_pv_per_bp"] - gv["premium"]) / 1e3]
+    q = Q("2B", "convexity:cost", lvl, "b_l3_straddle", seed,
+          f"You buy GBP 100m of a 1Y-into-10Y ATM swaption straddle (implied normal vol {NVOL*1e4:.0f}bp). (a) How far must "
+          f"the forward swap rate move by expiry, either way, to break even? (b) If the rate's realised normal vol over the "
+          f"year turns out to be {rv:.0f}bp, what is your expected P&L at expiry? (E|move| = sigma x sqrt(2/pi).)",
+          [num("(a) Breakeven (bp)", "bp", tol_rel=0.03), num("(b) Expected P&L (GBP k)", "k", tol_rel=0.05, tol_abs=20)],
+          "How is this like gamma vs theta?", "",
+          ["Breakeven = premium / annuity per bp", "Expected payoff = annuity x sigma_realised x sqrt(2/pi)",
+           "Long convexity wins only if realised beats implied"])
+    attach_givens(q, g, labels, solver)
+    q.model_answer = (f"**(a) {q.parts[0].correct:.0f}bp, (b) {fmt_ccy(q.parts[1].correct * 1e3)}.**\n\n1. At expiry the "
+                      f"straddle pays annuity x |move|, so breakeven = premium / (annuity PV per bp).\n2. Expected payoff = "
+                      f"annuity x E|move| = annuity x {rv:.0f} x 0.798 = {fmt_ccy(0.7979 * rv * g['annuity_pv_per_bp'])}; minus "
+                      f"the premium gives (b).\n3. For an ATM straddle the breakeven equals E|move| at the IMPLIED vol "
+                      f"({NVOL*1e4:.0f}bp x 0.798), so you make money exactly when realised beats implied: pure long "
+                      f"convexity, paid for up front (theta).")
+    return q
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # 2C Curve trades
-# ---------------------------------------------------------------------------
+# =============================================================================
 LABELS = ["Bull steepener", "Bull flattener", "Bear steepener", "Bear flattener"]
 DRIVERS = {
-    "Bull steepener": "front end falls more: markets price earlier or deeper central-bank cuts",
-    "Bull flattener": "long end falls more: growth or inflation fears, flight to duration, long-end demand",
-    "Bear steepener": "long end rises more: term premium, supply, fiscal worries, inflation risk",
-    "Bear flattener": "front end rises more: central bank hiking or pricing out cuts",
+    "Bull steepener": "front end rallies more: earlier or deeper central-bank cuts priced",
+    "Bull flattener": "long end rallies more: growth/inflation fears, flight to duration, long-end demand",
+    "Bear steepener": "long end sells off more: term premium, supply, fiscal or inflation worries",
+    "Bear flattener": "front end sells off more: hikes, or cuts priced out",
 }
 
 
-def _dv01_neutral_steepener(c, n10=100e6):
+def _moves(rng, lab):
+    a, b = sorted([float(rng.integers(5, 15)), float(rng.integers(20, 40))])
+    bull, steep = lab.startswith("Bull"), lab.endswith("steepener")
+    if bull:
+        return (-b, -a) if steep else (-a, -b)
+    return (a, b) if steep else (b, a)
+
+
+def _steepener(c, n10=100e6):
     p2, p10 = par_swap_rate(c, 0, 2), par_swap_rate(c, 0, 10)
     pay10 = Swap(0, 10, p10, n10, "pay")
-    d10 = abs(risk(pay10, c).dv01)
-    d2u = risk(Swap(0, 2, p2, 1.0, "receive"), c).dv01
-    rec2 = Swap(0, 2, p2, d10 / d2u, "receive")
-    return rec2, pay10
+    d10 = abs(risk(pay10, c).dv01); d2u = risk(Swap(0, 2, p2, 1.0, "receive"), c).dv01
+    return Swap(0, 2, p2, d10 / d2u, "receive"), pay10
 
 
-def c_label(rng, d, seed):
-    c = base_curve()
-    lab = str(rng.choice(LABELS))
-    a, b = sorted([float(rng.integers(5, 15)), float(rng.integers(20, 40))])
-    bull = lab.startswith("Bull")
-    steep = lab.endswith("steepener")
-    if bull:
-        m2, m10 = (-b, -a) if steep else (-a, -b)
+def c_l1_label(rng, lvl, seed):
+    lab = str(rng.choice(LABELS)); m2, m10 = _moves(rng, lab)
+    makes = (m10 - m2) > 0
+    return Q("2C", "curve:labels", lvl, "c_l1_label", seed,
+             f"2Y SONIA swaps move **{m2:+.0f}bp** and 10Y move **{m10:+.0f}bp**. What kind of move is this? Does a "
+             f"DV01-neutral 2s10s steepener make or lose money?",
+             [mcq("Curve move", LABELS, LABELS.index(lab)), mcq("Steepener", ["Makes money", "Loses money"], 0 if makes else 1)],
+             "What typically drives this kind of move?",
+             f"**{lab}; the steepener {'makes' if makes else 'loses'} money.**\n\n1. Bull = yields fall, bear = yields rise; "
+             f"steepener = 10Y minus 2Y widens.\n2. The curve {'steepened' if makes else 'flattened'} by {abs(m10 - m2):.0f}bp. "
+             f"A DV01-neutral steepener (receive 2Y, pay 10Y) earns DV01 x (change in 10Y - change in 2Y).\n"
+             f"3. Typical driver: {DRIVERS[lab]}.", [lab, DRIVERS[lab]])
+
+
+def c_l1_convexity(rng, lvl, seed):
+    trade = str(rng.choice(["steepener", "flattener"]))
+    q_kind = str(rng.choice(["sign", "big_move"]))
+    c = base_curve(); rec2, pay10 = _steepener(c)
+    book = Composite([rec2, pay10]) if trade == "steepener" else Composite([
+        Swap(0, 2, rec2.fixed, rec2.notional, "pay"), Swap(0, 10, pay10.fixed, pay10.notional, "receive")])
+    cx = risk(book, c).convexity_pnl
+    if q_kind == "sign":
+        prompt = f"You hold a **DV01-neutral 2s10s {trade}**. Are you long or short convexity, and why?"
+        parts = [mcq("Convexity", LONG_SHORT, 0 if cx > 0 else 1)]
     else:
-        m2, m10 = (a, b) if steep else (b, a)
-    rec2, pay10 = _dv01_neutral_steepener(c)
-    book = Composite([rec2, pay10])
-    moved = move_curve(c, {2: m2, 10: m10})
-    p = pnl(book, c, moved)
-    model = (f"**{lab}; your DV01-neutral 2s10s steepener makes {fmt_ccy(p)}.**\n\n"
-             f"1. Bull = yields fall, bear = yields rise. Steepener = 10y minus 2y widens; flattener = it narrows.\n"
-             f"2. 2y {m2:+.0f}bp, 10y {m10:+.0f}bp: the curve {'steepened' if m10 - m2 > 0 else 'flattened'} by "
-             f"{abs(m10 - m2):.0f}bp. Typical driver: {DRIVERS[lab]}.\n"
-             f"3. Steepener = receive 2y, pay 10y, DV01-matched: P&L ~ DV01 x (change in 10y - change in 2y) = "
-             f"{fmt_ccy(risk(pay10, c).dv01 * -1)} per bp x {m10 - m2:+.0f} ~ {fmt_ccy(p)}.")
-    return Question("rates", "2C", "curve:labels", d, "c_label", seed,
-                    prompt=(f"2y SONIA swaps move **{m2:+.0f}bp** and 10y move **{m10:+.0f}bp**. What kind of move is "
-                            f"this? What is the P&L of a DV01-neutral 2s10s steepener with GBP 100m on the 10y leg?"),
-                    parts=[Part("mcq", "Curve move", LABELS, LABELS.index(lab)),
-                           Part("numeric", "Steepener P&L (GBP k)", correct=p / 1e3, tol_abs=max(3.0, 0.1 * abs(p / 1e3)))],
-                    free_text_prompt="What typically drives this kind of move?",
-                    facts={"move_2y": m2, "move_10y": m10, "label": lab, "steepener_pnl": p,
-                           "dv01_10y_leg": risk(pay10, c).dv01, "dv01_2y_leg": risk(rec2, c).dv01},
-                    model_answer=model, rubric=[lab, "Steepener P&L ~ DV01 x (d10 - d2)", DRIVERS[lab]])
+        bp = int(rng.choice([75, 100])) * int(rng.choice([1, -1]))
+        p = pnl(book, c, c.shifted(bp))
+        prompt = (f"You hold a **DV01-neutral 2s10s {trade}**. The whole curve moves {bp:+d}bp in parallel (no change in "
+                  f"slope). Do you make or lose money?")
+        parts = [mcq("P&L", GAIN_LOSE, 0 if p > 0 else 1)]
+    return Q("2C", "curve:convexity", lvl, f"c_l1_convexity_{q_kind}", seed, prompt, parts,
+             "Explain using convexity per unit of DV01, and how it interacts with a bull or bear move.",
+             f"**A DV01-neutral steepener is SHORT convexity; a flattener is LONG convexity.**\n\n1. Convexity per unit of "
+             f"DV01 rises with maturity, so the 10Y leg carries far more convexity than the 2Y leg for the same DV01.\n"
+             f"2. A steepener pays fixed in 10Y (short the 10Y's convexity) and receives 2Y (long a little): net short. Big "
+             f"parallel moves either way hurt the steepener and help the flattener, all else equal.\n3. Interaction: in a "
+             f"bull steepener the slope gain is partly offset by the convexity loss; in a large bear flattener the "
+             f"flattener earns both slope and convexity.\n4. Illustration (engine): +/-25bp convexity P&L of this "
+             f"{trade} = {fmt_ccy(cx)}.",
+             ["Steepener short convexity, flattener long", "10Y has more convexity per DV01", "Big parallel moves hurt the steepener"])
 
 
-def c_sizing(rng, d, seed):
-    c = base_curve()
-    n10 = float(rng.choice([50e6, 100e6, 200e6]))
-    rec2, pay10 = _dv01_neutral_steepener(c, n10)
-    ratio = rec2.notional / n10
-    eq = Composite([Swap(0, 2, rec2.fixed, n10, "receive"), pay10])
-    bp = float(rng.choice([25, 50]) * rng.choice([1, -1]))
-    p_eq = pnl(eq, c, c.shifted(bp))
-    p_w = pnl(Composite([rec2, pay10]), c, c.shifted(bp))
-    model = (f"**Receive about GBP {rec2.notional/1e6:,.0f}m of 2y ({ratio:.2f}x the 10y notional).**\n\n"
-             f"1. A curve trade should make money from the SHAPE changing, not the LEVEL. So match DV01s, not notionals.\n"
-             f"2. 10y DV01 {fmt_ccy(-risk(pay10, c).dv01)} per bp vs 2y DV01 per GBP 1m "
-             f"{fmt_ccy(risk(Swap(0, 2, rec2.fixed, 1e6, 'receive'), c).dv01)}: ratio {ratio:.2f}.\n"
-             f"3. Equal notionals leave you net short duration (the 10y leg dominates): a {bp:+.0f}bp parallel move gives "
-             f"{fmt_ccy(p_eq)} instead of {fmt_ccy(p_w)} for the DV01-neutral version. That is an unintended "
-             f"directional bet.")
-    return Question("rates", "2C", "curve:sizing", d, "c_sizing", seed,
-                    prompt=(f"You want a 2s10s steepener: pay fixed on GBP {n10/1e6:.0f}m 10y. How much 2y should you "
-                            f"receive to be DV01-neutral? What goes wrong with equal notionals if rates move {bp:+.0f}bp in parallel?"),
-                    parts=[Part("numeric", "2y notional (GBP m)", correct=rec2.notional / 1e6, tol_rel=0.08, unit="m"),
-                           Part("numeric", f"Equal-notional P&L for {bp:+.0f}bp parallel (GBP k)", correct=p_eq / 1e3,
-                                tol_abs=max(3.0, 0.1 * abs(p_eq / 1e3)))],
-                    free_text_prompt="Explain DV01 weighting.",
-                    facts={"notional_2y": rec2.notional, "ratio": ratio, "pnl_equal_notional": p_eq, "pnl_dv01_neutral": p_w},
-                    model_answer=model, rubric=["Match DV01 not notional", f"Ratio ~{ratio:.1f}x", "Equal notional = residual duration"])
+def c_l1_boe(rng, lvl, seed):
+    opts, corr = shuffle_opts(rng, "Receive 2Y vs pay 10Y, DV01-weighted (steepener)",
+                              ["Pay 2Y vs receive 10Y (flattener)", "Pay 10Y outright", "Buy 30Y gilts outright"])
+    return Q("2C", "curve:expression", lvl, "c_l1_boe", seed,
+             "You think the BoE cuts sooner than the market prices. What curve trade expresses it?",
+             [mcq("Trade", opts, corr)], "Explain, including the main risks.",
+             "**Receive the front end: a DV01-neutral 2s10s steepener.** Earlier cuts pull down expected policy rates over "
+             "the next 1-2 years, so the front end rallies most (bull steepener). DV01 weighting removes the bet on the level. "
+             "Risks: growth fears rally the long end too (bull flattener), and the steepener is short convexity.",
+             ["Receive front end / steepener", "DV01-neutral", "Risks"])
 
 
-def c_boe_view(rng, d, seed):
-    c = base_curve()
-    opts = ["Receive 2y SONIA vs pay 10y, DV01-weighted (2s10s steepener)",
-            "Pay 2y vs receive 10y (flattener)", "Pay 10y outright", "Buy 30y gilts outright"]
-    rec2, pay10 = _dv01_neutral_steepener(c)
-    model = (f"**{opts[0]}.**\n\n1. Earlier cuts pull down expected policy rates over the next 1-2 years, so the front "
-             f"end rallies most: a bull steepener. Receiving the 2y captures it; paying 10y DV01-neutral removes the "
-             f"bet on the overall level.\n2. Sizing: pay GBP 100m 10y, receive ~GBP {rec2.notional/1e6:,.0f}m 2y "
-             f"(DV01 {fmt_ccy(risk(rec2, c).dv01)} vs {fmt_ccy(risk(pay10, c).dv01)} per bp).\n3. Purer alternatives: "
-             f"receive a specific meeting-dated OIS or SONIA futures around the meeting you think is mispriced.\n"
-             f"4. Risks: the cuts come with growth fears that rally the long end too (bull flattener), or term "
-             f"premium falls.")
-    return Question("rates", "2C", "curve:expression", d, "c_boe", seed,
-                    prompt="You think the BoE cuts sooner than the market prices. What curve trade do you put on, and how do you size it?",
-                    parts=[Part("mcq", "Trade", opts, 0)], free_text_prompt="Explain the trade, sizing and risks.",
-                    facts={"notional_2y_for_100m_10y": rec2.notional}, model_answer=model,
-                    rubric=["Receive front end / steepener", "DV01-neutral sizing", "Risks"])
+def c_l2_pnl(rng, lvl, seed):
+    c = base_curve(); lab = str(rng.choice(LABELS)); m2, m10 = _moves(rng, lab); rec2, pay10 = _steepener(c)
+    g = {"dv01_2y_leg": round(risk(rec2, c).dv01, 0), "dv01_10y_leg": round(risk(pay10, c).dv01, 0), "move_2y_bp": m2,
+         "move_10y_bp": m10}
+    labels = {"dv01_2y_leg": "DV01 of the receive-2Y leg (GBP/bp, + long duration)",
+              "dv01_10y_leg": "DV01 of the pay-10Y leg (GBP/bp, - short duration)", "move_2y_bp": "2Y move (bp)",
+              "move_10y_bp": "10Y move (bp)"}
+    solver = lambda gv: [(-gv["dv01_2y_leg"] * gv["move_2y_bp"] - gv["dv01_10y_leg"] * gv["move_10y_bp"]) / 1e3]
+    q = Q("2C", "curve:pnl", lvl, "c_l2_pnl", seed,
+          f"DV01-neutral 2s10s steepener, GBP 100m on the 10Y leg (Givens). 2Y moves {m2:+.0f}bp, 10Y {m10:+.0f}bp. What "
+          f"kind of move is it, and what is your P&L?",
+          [mcq("Curve move", LABELS, LABELS.index(lab)), num("P&L (GBP thousands)", "k", tol_rel=0.02, tol_abs=1)],
+          "Explain.", "", [lab, "P&L = sum of -DV01 x move per leg"])
+    attach_givens(q, g, labels, solver)
+    exact = pnl(Composite([rec2, pay10]), c, move_curve(c, {2: m2, 10: m10}))
+    q.model_answer = (f"**{lab}; P&L about {fmt_ccy(q.parts[1].correct * 1e3)}.**\n\n1. Each leg: -DV01 x its own move: "
+                      f"2Y {fmt_ccy(-g['dv01_2y_leg'] * m2)}, 10Y {fmt_ccy(-g['dv01_10y_leg'] * m10)}.\n2. With matched DV01s "
+                      f"that is DV01 x (change in 10Y - change in 2Y).\n3. Exact (engine, curve repriced): {fmt_ccy(exact)}.")
+    return q
 
 
-# ---------------------------------------------------------------------------
+def c_l2_sizing(rng, lvl, seed):
+    c = base_curve(); n10 = float(rng.choice([50e6, 100e6, 200e6]))
+    d2 = risk(Swap(0, 2, par_swap_rate(c, 0, 2), 1e6, "receive"), c).dv01
+    d10 = risk(Swap(0, 10, par_swap_rate(c, 0, 10), 1e6, "receive"), c).dv01
+    g = {"n10_m": n10 / 1e6, "dv01_2y_per_1m": round(d2, 2), "dv01_10y_per_1m": round(d10, 2)}
+    labels = {"n10_m": "10Y notional (GBP m)", "dv01_2y_per_1m": "2Y swap DV01 per GBP 1m (GBP/bp)",
+              "dv01_10y_per_1m": "10Y swap DV01 per GBP 1m (GBP/bp)"}
+    solver = lambda gv: [gv["n10_m"] * gv["dv01_10y_per_1m"] / gv["dv01_2y_per_1m"]]
+    q = Q("2C", "curve:sizing", lvl, "c_l2_sizing", seed,
+          f"You want a 2s10s steepener: pay fixed on GBP {n10/1e6:.0f}m 10Y. Using the DV01s in the Givens, how much 2Y "
+          f"should you receive to be DV01-neutral?", [num("2Y notional (GBP m)", "m", tol_rel=0.02)],
+          "Why match DV01 rather than notional?", "", ["Match DV01s", "Notional ratio = DV01_10 / DV01_2"])
+    attach_givens(q, g, labels, solver)
+    q.model_answer = (f"**About GBP {q.parts[0].correct:,.0f}m.**\n\n1. A curve trade should make money from the shape, not "
+                      f"the level, so the two legs' DV01s must match.\n2. {n10/1e6:.0f}m x {g['dv01_10y_per_1m']} / "
+                      f"{g['dv01_2y_per_1m']} = {q.parts[0].correct:,.0f}m.")
+    return q
+
+
+def c_l2_convexity_pnl(rng, lvl, seed):
+    c = base_curve(); rec2, pay10 = _steepener(c); bp = int(rng.choice([75, 100, 150]))
+    g = {"gamma_2y_leg": round(dv01_gamma(rec2, c), 2), "gamma_10y_leg": round(dv01_gamma(pay10, c), 2), "dy_bp": bp}
+    labels = {"gamma_2y_leg": "Receive-2Y leg: change in DV01 per +1bp (GBP/bp per bp)",
+              "gamma_10y_leg": "Pay-10Y leg: change in DV01 per +1bp (GBP/bp per bp)", "dy_bp": "Parallel move (bp, either way)"}
+    solver = lambda gv: [-0.5 * (gv["gamma_2y_leg"] + gv["gamma_10y_leg"]) * gv["dy_bp"] ** 2 / 1e3]
+    q = Q("2C", "curve:convexity", lvl, "c_l2_convexity_pnl", seed,
+          f"Your DV01-neutral 2s10s steepener (GBP 100m 10Y leg) sees a {bp}bp parallel move with no change in slope. "
+          f"Using the Givens, estimate the convexity P&L. Long or short convexity?",
+          [num("Convexity P&L (GBP thousands)", "k", tol_rel=0.05, tol_abs=1), mcq("Convexity", LONG_SHORT, 1)],
+          "Explain why a steepener is short convexity.", "",
+          ["P&L ~ -0.5 (G2 + G10) dy^2", "Steepener short convexity", "10Y leg dominates"])
+    attach_givens(q, g, labels, solver)
+    book = Composite([rec2, pay10]); exact = pnl(book, c, c.shifted(bp))
+    q.parts[1].correct = 0 if q.parts[0].correct > 0 else 1
+    q.model_answer = (f"**About {fmt_ccy(q.parts[0].correct * 1e3)}: short convexity.**\n\n1. DV01-neutral, so the first-order "
+                      f"terms cancel. What is left: -0.5 x (G_2Y + G_10Y) x dy^2.\n2. Paying 10Y makes the 10Y leg's DV01 "
+                      f"move against you as rates move, and per unit of DV01 the 10Y has much more convexity than the 2Y.\n"
+                      f"3. Exact (engine, +{bp}bp): {fmt_ccy(exact)}.")
+    return q
+
+
+def c_l3_full(rng, lvl, seed):
+    c = base_curve(); n10 = float(rng.choice([50e6, 100e6, 200e6])); bp = float(rng.choice([25, 50]) * rng.choice([1, -1]))
+    d2 = risk(Swap(0, 2, par_swap_rate(c, 0, 2), 1e6, "receive"), c).dv01
+    d10 = risk(Swap(0, 10, par_swap_rate(c, 0, 10), 1e6, "receive"), c).dv01
+    g = {"n10_m": n10 / 1e6, "dv01_2y_per_1m": round(d2, 2), "dv01_10y_per_1m": round(d10, 2), "dy_bp": bp}
+    labels = {"n10_m": "10Y notional paid (GBP m)", "dv01_2y_per_1m": "2Y DV01 per GBP 1m (GBP/bp)",
+              "dv01_10y_per_1m": "10Y DV01 per GBP 1m (GBP/bp)", "dy_bp": "Parallel move (bp)"}
+    solver = lambda gv: [gv["n10_m"] * gv["dv01_10y_per_1m"] / gv["dv01_2y_per_1m"],
+                         -(gv["n10_m"] * gv["dv01_2y_per_1m"] - gv["n10_m"] * gv["dv01_10y_per_1m"]) * gv["dy_bp"] / 1e3]
+    q = Q("2C", "curve:sizing", lvl, "c_l3_full", seed,
+          f"2s10s steepener paying fixed on GBP {n10/1e6:.0f}m 10Y. (a) How much 2Y do you receive to be DV01-neutral? "
+          f"(b) If you used equal notionals instead, what would a {bp:+.0f}bp parallel move do to your P&L?",
+          [num("(a) 2Y notional (GBP m)", "m", tol_rel=0.02), num("(b) Equal-notional P&L (GBP k)", "k", tol_rel=0.03, tol_abs=1)],
+          "Explain what goes wrong with equal notionals.", "",
+          ["Match DV01s", "Equal notionals leave net short duration", "Unintended directional bet"])
+    attach_givens(q, g, labels, solver)
+    eq = Composite([Swap(0, 2, par_swap_rate(c, 0, 2), n10, "receive"), Swap(0, 10, par_swap_rate(c, 0, 10), n10, "pay")])
+    exact = pnl(eq, c, c.shifted(bp))
+    q.model_answer = (f"**(a) GBP {q.parts[0].correct:,.0f}m; (b) about {fmt_ccy(q.parts[1].correct * 1e3)}.**\n\n1. Equal "
+                      f"notionals leave you net short duration: net DV01 = {n10/1e6:.0f}m x ({g['dv01_2y_per_1m']} - "
+                      f"{g['dv01_10y_per_1m']}) per bp.\n2. A parallel move then creates P&L that has nothing to do with "
+                      f"the slope view.\n3. Exact (engine): {fmt_ccy(exact)}; the residual is convexity.")
+    return q
+
+
+def c_l3_fly(rng, lvl, seed):
+    # PCA-weighted 2s5s10s fly: neutralise level and slope with loadings given
+    lv = {"2": 1.0, "5": 1.05, "10": 0.95}
+    sl = {"2": -0.6, "5": 0.05, "10": 0.55}
+    lv = {k: round(v + float(rng.normal(0, 0.03)), 2) for k, v in lv.items()}
+    sl = {k: round(v + float(rng.normal(0, 0.03)), 2) for k, v in sl.items()}
+    g = {"belly_dv01": 100e3, "lev_2": lv["2"], "lev_5": lv["5"], "lev_10": lv["10"], "slope_2": sl["2"], "slope_5": sl["5"],
+         "slope_10": sl["10"]}
+    labels = {"belly_dv01": "Belly (5Y) DV01 you receive (GBP/bp)", "lev_2": "Level loading 2Y", "lev_5": "Level loading 5Y",
+              "lev_10": "Level loading 10Y", "slope_2": "Slope loading 2Y", "slope_5": "Slope loading 5Y",
+              "slope_10": "Slope loading 10Y"}
+
+    def solver(gv):
+        A = np.array([[gv["lev_2"], gv["lev_10"]], [gv["slope_2"], gv["slope_10"]]])
+        b = np.array([gv["belly_dv01"] * gv["lev_5"], gv["belly_dv01"] * gv["slope_5"]])
+        w2, w10 = np.linalg.solve(A, b)
+        return [w2, w10]
+    q = Q("2C", "curve:fly_pca", lvl, "c_l3_fly", seed,
+          "You receive the 5Y in a 2s5s10s butterfly (belly DV01 in the Givens) and pay the wings. Choose wing DV01s so the "
+          "trade is neutral to the first two PCA factors (level and slope), using the loadings given (bp move per unit "
+          "factor move).", [num("2Y wing DV01 to pay (GBP/bp)", tol_rel=0.02), num("10Y wing DV01 to pay (GBP/bp)", tol_rel=0.02)],
+          "Why PCA weights rather than 50/50 DV01 weights?", "",
+          ["Solve two equations: level and slope exposures cancel", "50/50 DV01 leaves slope risk", "Residual = curvature view"])
+    attach_givens(q, g, labels, solver)
+    w2, w10 = q.parts[0].correct, q.parts[1].correct
+    q.model_answer = (f"**Pay about {w2:,.0f} (2Y) and {w10:,.0f} (10Y) DV01.**\n\n1. Exposure to a factor = sum of DV01 x "
+                      f"loading. Set level and slope exposure of the wings equal to the belly's:\n   w2 x L2 + w10 x L10 = "
+                      f"B x L5 and w2 x S2 + w10 x S10 = B x S5.\n2. Solving gives the weights above (not 50/50).\n3. A "
+                      f"50/50 DV01 fly is hedged for parallel moves only; when the curve steepens the wings move "
+                      f"differently and you get slope P&L. PCA weights leave mostly curvature.")
+    return q
+
+
+# =============================================================================
 # 2D Carry and roll-down
-# ---------------------------------------------------------------------------
-def d_carry_roll(rng, d, seed):
-    c = ZeroCurve.from_pct({0.25: 2.75, 1: 3.0, 2: 3.3, 5: 3.9, 10: 4.4, 30: 4.8})
-    h = 0.25
-    r5, r10 = receiver_carry_rolldown(c, 5, h), receiver_carry_rolldown(c, 10, h)
-    better = 0 if r5["total_bp"] > r10["total_bp"] else 1
-    ask = int(rng.choice([5, 10]))
-    rr = r5 if ask == 5 else r10
-    model = (f"**Receiving {ask}y: carry {rr['carry_bp']:.1f}bp + roll {rr['roll_bp']:.1f}bp = {rr['total_bp']:.1f}bp "
-             f"over 3 months.**\n\n1. Carry: you receive the fixed rate and pay the (lower) short floating rate: "
-             f"({rr['par_rate']*100:.2f}% - {rr['float_rate']*100:.2f}%) x 0.25.\n2. Roll-down: on an unchanged, "
-             f"upward-sloping curve your {ask}y swap becomes a {ask - h:.2f}y swap, which is priced at a lower rate, "
-             f"so it gains in value.\n3. 5y: {r5['total_bp']:.1f}bp vs 10y: {r10['total_bp']:.1f}bp (per unit DV01). "
-             f"The {['5y', '10y'][better]} wins here; note how the carry/roll split differs between the two, and that "
-             f"carry is earned only if the curve does not move.\n4. Breakeven: rates can "
-             f"rise ~{rr['total_bp']:.0f}bp in {ask}y over the 3 months before the trade loses.")
-    return Question("rates", "2D", "carry:roll", d, "d_carry", seed,
-                    prompt=(f"Curve (zero rates): 3M 2.75%, 1y 3.0%, 2y 3.3%, 5y 3.9%, 10y 4.4%, 30y 4.8%. What is the "
-                            f"3-month carry plus roll-down (bp of rate) on receiving the **{ask}y** swap? Which is better per "
-                            f"DV01: receiving 5y or 10y?"),
-                    parts=[Part("numeric", f"{ask}y carry + roll (bp)", correct=rr["total_bp"], tol_abs=max(1.0, 0.1 * abs(rr["total_bp"]))),
-                           Part("mcq", "Better per DV01", ["5y", "10y"], better)],
-                    free_text_prompt="Explain carry, roll-down and the breakeven.",
-                    facts={"5y": r5, "10y": r10, "horizon_years": h}, model_answer=model,
-                    rubric=["Carry = fixed - floating", "Roll-down from curve slope", "Breakeven in bp"],
-                    charts=[chart_bar("Carry + roll over 3M (bp)", ["5y carry", "5y roll", "10y carry", "10y roll"],
-                                      [r5["carry_bp"], r5["roll_bp"], r10["carry_bp"], r10["roll_bp"]], "bp")])
+# =============================================================================
+STEEP = {0.25: 2.75, 1: 3.0, 2: 3.3, 5: 3.9, 10: 4.4, 30: 4.8}
 
 
-# ---------------------------------------------------------------------------
-# 2E Central-bank pricing
-# ---------------------------------------------------------------------------
-def e_probability(rng, d, seed):
-    cb = str(rng.choice(["BoE (SONIA)", "Fed (SOFR / fed funds)"]))
-    if d == 1:
-        priced = -float(rng.choice([5, 10, 15, 20]))
-        r = implied_move_probability(priced)
-        ans = r["prob_next_step"] * 100
-        prompt = f"{cb} OIS prices **{priced:.0f}bp** for the next meeting. Assuming the choice is hold or a 25bp cut, what is the implied probability of a cut?"
-        steps = f"probability = {abs(priced):.0f} / 25 = {ans:.0f}%."
-    else:
-        p1 = -float(rng.choice([5, 10, 15, 20]))
-        p2 = p1 - float(rng.choice([10, 15, 20, 25]))
-        incr = p2 - p1
-        ans = abs(incr) / 25 * 100
-        r = {"meeting1": p1, "cumulative_meeting2": p2}
-        prompt = (f"{cb} OIS prices **{p1:.0f}bp** cumulative by meeting 1 and **{p2:.0f}bp** cumulative by meeting 2. "
-                  f"Holding the meeting-1 pricing as given, what probability of a 25bp cut is priced AT meeting 2?")
-        steps = f"incremental pricing at meeting 2 = {p2:.0f} - ({p1:.0f}) = {incr:.0f}bp, so probability = {abs(incr):.0f}/25 = {ans:.0f}%."
-    model = (f"**{ans:.0f}%.**\n\n1. OIS forwards price the expected policy rate. With only 'hold' or 'cut 25bp' "
-             f"possible, the expected change = p x (-25bp).\n2. So {steps}\n3. Caveats: meeting dates vs averaging "
-             f"periods, term premium, and the chance of a 50bp move all blur this.")
-    return Question("rates", "2E", "cb:probabilities", d, "e_prob", seed, prompt=prompt,
-                    parts=[Part("numeric", "Probability (%)", correct=ans, tol_abs=2.0, unit="%")],
-                    free_text_prompt="Explain the calculation and its caveats.", facts=dict(r, answer_pct=ans),
-                    model_answer=model, rubric=["Expected change = p x step", f"{ans:.0f}%"])
+def d_l1(rng, lvl, seed):
+    kind = str(rng.choice(["carry_sign", "kills"]))
+    if kind == "carry_sign":
+        return Q("2D", "carry:roll", lvl, "d_l1_sign", seed,
+                 "The curve is steep and upward-sloping (3M SONIA 2.75%, 5Y 3.9%, 10Y 4.4%). You receive fixed in 5Y. Is your "
+                 "carry positive or negative? Does roll-down help or hurt you?",
+                 [mcq("Carry", ["Positive", "Negative"], 0), mcq("Roll-down", ["Helps", "Hurts"], 0)],
+                 "Explain carry and roll-down.",
+                 "**Positive carry, and roll-down helps.**\n\n1. Carry: you receive the 5Y fixed rate and pay the lower "
+                 "short-term floating rate.\n2. Roll-down: on an unchanged curve your 5Y swap becomes a shorter swap, which is "
+                 "priced at a lower rate, so receiving the original higher rate gains value.",
+                 ["Receive fixed > pay floating", "Roll down a steep curve"])
+    opts, corr = shuffle_opts(rng, "Rates rise by more than the carry plus roll over the horizon",
+                              ["Rates stay exactly where they are", "The curve stays steep", "Rates fall"])
+    return Q("2D", "carry:breakeven", lvl, "d_l1_kills", seed,
+             "You receive 10Y on a steep curve for its carry and roll-down. What makes the trade lose money?",
+             [mcq("Loses if", opts, corr)], "Explain the breakeven.",
+             "**A rise in rates bigger than carry + roll.** Carry and roll are what you earn if nothing moves; they are your "
+             "cushion. The breakeven is how many bp the rate can rise over the horizon before the duration loss eats it.",
+             ["Breakeven = carry + roll in bp"])
 
 
-def e_reaction(rng, d, seed):
-    priced = -float(rng.choice([15, 20]))
-    p = abs(priced) / 25
-    opts = ["2y yields rise: the market removes the cuts it had priced", "2y yields fall",
-            "Nothing: it was priced in", "Only 30y yields move"]
-    model = (f"**{opts[0]}.**\n\n1. {abs(priced):.0f}bp priced = a {p*100:.0f}% cut probability. A hold surprises "
-             f"the market by about +{abs(priced):.0f}bp on that meeting, and usually pushes out the expected path of "
-             f"later cuts too.\n2. The front end (2y) reprices most: a bear flattener is typical.\n3. A receiver of 2y "
-             f"loses ~DV01 x the move.")
-    return Question("rates", "2E", "cb:reaction", d, "e_react", seed,
-                    prompt=f"SONIA prices {priced:.0f}bp for the next BoE meeting and the BoE holds. What happens to the front end?",
-                    parts=[Part("mcq", "Reaction", opts, 0)], free_text_prompt="Explain.",
-                    facts={"priced_bp": priced, "implied_prob": p}, model_answer=model,
-                    rubric=["Hold = hawkish surprise vs pricing", "Front end sells off", "Bear flattener"])
+def d_l2(rng, lvl, seed):
+    c = ZeroCurve.from_pct(STEEP); T = int(rng.choice([5, 10])); h = 0.25
+    g = {"par_T_pct": round(par_swap_rate(c, 0, T) * 100, 4), "par_T_minus_h_pct": round(par_swap_rate(c, 0, T - h) * 100, 4),
+         "float_pct": round(c.fwd(0, 0.25) * 100, 4), "horizon_years": h}
+    labels = {"par_T_pct": f"{T}Y par swap rate (%)", "par_T_minus_h_pct": f"{T - h:g}Y par swap rate (%)",
+              "float_pct": "3M floating rate (%)", "horizon_years": "Horizon (years)"}
+    solver = lambda gv: [(gv["par_T_pct"] - gv["float_pct"]) * 100 * gv["horizon_years"],
+                         (gv["par_T_pct"] - gv["par_T_minus_h_pct"]) * 100]
+    q = Q("2D", "carry:roll", lvl, "d_l2", seed,
+          f"You receive fixed in {T}Y. Using the Givens, what are the 3-month carry and roll-down, in bp of rate?",
+          [num("Carry (bp)", "bp", tol_abs=0.5, tol_rel=0.02), num("Roll-down (bp)", "bp", tol_abs=0.3, tol_rel=0.03)],
+          "Explain each piece.", "", ["Carry = (fixed - floating) x horizon", "Roll = par(T) - par(T - h)"])
+    attach_givens(q, g, labels, solver)
+    q.model_answer = (f"**Carry {q.parts[0].correct:.1f}bp, roll {q.parts[1].correct:.1f}bp.**\n\n1. Carry = ({g['par_T_pct']} - "
+                      f"{g['float_pct']})% x 0.25.\n2. Roll: in 3 months your swap is a {T - h:g}Y swap, priced at "
+                      f"{g['par_T_minus_h_pct']}%; receiving {g['par_T_pct']}% vs that is the roll-down.")
+    return q
 
 
-# ---------------------------------------------------------------------------
+def d_l3(rng, lvl, seed):
+    c = ZeroCurve.from_pct(STEEP); h = 0.25
+    g = {}
+    for T in (5, 10):
+        g[f"par_{T}"] = round(par_swap_rate(c, 0, T) * 100, 4)
+        g[f"par_{T}_rolled"] = round(par_swap_rate(c, 0, T - h) * 100, 4)
+    g["float_pct"] = round(c.fwd(0, 0.25) * 100, 4)
+    g["dv01_10y"] = round(risk(Swap(0, 10, par_swap_rate(c, 0, 10), 100e6, "receive"), c).dv01, 0)
+    labels = {"par_5": "5Y par (%)", "par_5_rolled": "4.75Y par (%)", "par_10": "10Y par (%)", "par_10_rolled": "9.75Y par (%)",
+              "float_pct": "3M floating (%)", "dv01_10y": "DV01 of receiving GBP 100m 10Y (GBP/bp)"}
+
+    def solver(gv):
+        t5 = (gv["par_5"] - gv["float_pct"]) * 25 + (gv["par_5"] - gv["par_5_rolled"]) * 100
+        t10 = (gv["par_10"] - gv["float_pct"]) * 25 + (gv["par_10"] - gv["par_10_rolled"]) * 100
+        return [t5, t10, t10 * gv["dv01_10y"] / 1e3]
+    q = Q("2D", "carry:breakeven", lvl, "d_l3", seed,
+          "Using the Givens: (a) 3-month carry + roll (bp) for receiving 5Y, (b) the same for 10Y, (c) the GBP value of the "
+          "10Y carry+roll on GBP 100m. Which tenor is better per unit of DV01, and what is the 10Y breakeven?",
+          [num("(a) 5Y carry+roll (bp)", "bp", tol_abs=0.5), num("(b) 10Y carry+roll (bp)", "bp", tol_abs=0.5),
+           num("(c) 10Y carry+roll (GBP k)", "k", tol_rel=0.03)],
+          "Compare the two per DV01 and give the breakeven.", "",
+          ["Carry + roll in bp is per unit DV01", "Breakeven = carry+roll in bp", "Compare tenors"])
+    attach_givens(q, g, labels, solver)
+    a, b, cc = (p.correct for p in q.parts)
+    q.model_answer = (f"**5Y {a:.1f}bp, 10Y {b:.1f}bp; 10Y worth {fmt_ccy(cc * 1e3)}.**\n\n1. Carry + roll in bp of rate is "
+                      f"already per unit of DV01, so compare them directly: {'5Y' if a > b else '10Y'} is better.\n2. The "
+                      f"10Y breakeven is a {b:.1f}bp rise over 3 months before the trade loses.")
+    return q
+
+
+# =============================================================================
+# 2E Pricing central banks
+# =============================================================================
+def e_l1(rng, lvl, seed):
+    if rng.random() < 0.5:
+        priced = -float(rng.choice([5, 8, 18, 20]))
+        more = abs(priced) > 12.5
+        return Q("2E", "cb:probabilities", lvl, "e_l1_read", seed,
+                 f"SONIA prices **{priced:.0f}bp** for the next BoE meeting (moves come in 25bp). Does the market think a "
+                 f"cut is more or less likely than not?",
+                 [mcq("Market view", ["More likely than not", "Less likely than not"], 0 if more else 1)], "Explain.",
+                 f"**{'More' if more else 'Less'} likely than not.** With only hold or a 25bp cut, priced change = p x (-25bp), "
+                 f"so {abs(priced):.0f}bp means p {'above' if more else 'below'} 50% (12.5bp would be a coin toss).",
+                 ["Priced bp / 25 = probability"])
+    opts, corr = shuffle_opts(rng, "2Y yields rise: the market removes the cuts it had priced",
+                              ["2Y yields fall", "Nothing: it was priced in", "Only 30Y yields move"])
+    return Q("2E", "cb:reaction", lvl, "e_l1_react", seed,
+             "SONIA prices -20bp for the next BoE meeting and the BoE holds. What happens to the front end?",
+             [mcq("Reaction", opts, corr)], "Explain.",
+             "**The front end sells off.** A hold surprises by about +20bp on that meeting and usually pushes out later cuts; "
+             "2Y reprices most, typically a bear flattener.", ["Hawkish surprise vs pricing", "Front end sells off"])
+
+
+def e_l2(rng, lvl, seed):
+    priced = -float(rng.choice([5, 10, 15, 20, 30, 35]))
+    g = {"priced_bp": priced, "step_bp": 25.0}
+    labels = {"priced_bp": "Change priced for the meeting (bp)", "step_bp": "Size of one move (bp)"}
+    solver = lambda gv: [((abs(gv["priced_bp"]) % gv["step_bp"]) / gv["step_bp"]) * 100]
+    q = Q("2E", "cb:probabilities", lvl, "e_l2", seed,
+          "SONIA pricing for the next BoE meeting is in the Givens. Assuming moves come in whole steps and any full step is "
+          "certain, what probability is priced for the next (partial) step?",
+          [num("Probability (%)", "%", tol_abs=1.5)], "Explain the calculation and its caveats.", "",
+          ["p = priced / step (beyond full steps)", "Caveats: averaging, term premium"])
+    attach_givens(q, g, labels, solver)
+    full = int(abs(priced) // 25)
+    q.model_answer = (f"**{q.parts[0].correct:.0f}%{f' on top of {full} certain 25bp cut' if full else ''}.**\n\n Expected "
+                      f"change = full steps + p x 25bp. Caveats: meeting date vs averaging periods, term premium, and the chance "
+                      f"of a 50bp move.")
+    return q
+
+
+def e_l3(rng, lvl, seed):
+    p1 = -float(rng.choice([5, 10, 15, 20])); p2 = p1 - float(rng.choice([10, 15, 20, 25]))
+    rate = CFG["boe_bank_rate"]
+    g = {"bank_rate_pct": rate, "cum_m1_bp": p1, "cum_m2_bp": p2, "step_bp": 25.0}
+    labels = {"bank_rate_pct": "Bank Rate now (%)", "cum_m1_bp": "Cumulative pricing by meeting 1 (bp)",
+              "cum_m2_bp": "Cumulative pricing by meeting 2 (bp)", "step_bp": "Step size (bp)"}
+    solver = lambda gv: [abs(gv["cum_m2_bp"] - gv["cum_m1_bp"]) / gv["step_bp"] * 100,
+                         gv["bank_rate_pct"] + gv["cum_m2_bp"] / 100]
+    q = Q("2E", "cb:path", lvl, "e_l3", seed,
+          "Using the Givens: (a) what probability of a 25bp cut is priced AT meeting 2 (taking meeting 1's pricing as "
+          "given)? (b) What expected Bank Rate is priced after meeting 2?",
+          [num("(a) Probability at meeting 2 (%)", "%", tol_abs=1.5), num("(b) Expected rate after meeting 2 (%)", "%", tol_abs=0.01)],
+          "Explain how you read a meeting path.", "", ["Incremental pricing between meetings", "Rate path = current + cumulative"])
+    attach_givens(q, g, labels, solver)
+    q.model_answer = (f"**(a) {q.parts[0].correct:.0f}%, (b) {q.parts[1].correct:.3f}%.**\n\n1. Meeting 2's own pricing = "
+                      f"cumulative by 2 minus cumulative by 1 = {p2 - p1:.0f}bp, so p = {abs(p2 - p1):.0f}/25.\n2. Expected rate = "
+                      f"{rate}% + ({p2:.0f}bp).")
+    return q
+
+
+# =============================================================================
 # 2F Advanced
-# ---------------------------------------------------------------------------
-def f_ctd(rng, d, seed):
-    basket = [(0.04, 8.0), (0.05, 14.0), (0.035, 25.0)]
-    y = float(rng.choice([0.03, 0.045, 0.075]))
-    rows = ctd_analysis(basket, y)
-    ctd = [i for i, r in enumerate(rows) if r["ctd"]][0]
-    names = [f"{c*100:.1f}% {m:.0f}y" for c, m in basket]
-    model = (f"**CTD: {names[ctd]}.**\n\n1. The short chooses which bond to deliver and picks the one cheapest relative "
-             f"to its invoice price (futures x CF). Conversion factors price every bond at the notional coupon "
-             f"(6% here), which is only fair when yields are at 6%.\n2. When yields are above the notional coupon, "
-             f"high-duration bonds have fallen furthest in price relative to their CF, so they become CTD. When yields "
-             f"are below it, low-duration bonds are CTD.\n3. Engine at {y*100:.1f}%: " +
-             "; ".join(f"{names[i]} P/CF {r['p_over_cf']:.2f}, basis {r['gross_basis']:.2f}" for i, r in enumerate(rows)) +
-             ".\n4. The short's switch option (and timing / end-of-month options) makes futures trade cheap to the "
-             "CTD's forward: the delivery option.")
-    return Question("rates", "2F", "advanced:ctd", d, "f_ctd", seed,
-                    prompt=f"A futures basket has {', '.join(names)}. Notional coupon 6%, all bonds yield {y*100:.1f}%. Which bond is cheapest to deliver?",
-                    parts=[Part("mcq", "CTD", names, ctd)], free_text_prompt="Why, and what is the short's delivery option?",
-                    facts={"rows": rows, "yield": y}, model_answer=model,
-                    rubric=["CTD minimises price - F x CF", "Yields above notional coupon favour high duration",
-                            "Delivery option belongs to the short"])
-
-
-def f_normal_vol(rng, d, seed):
-    F = float(rng.choice([0.03, 0.035, 0.04, 0.045]))
-    sb = float(rng.choice([0.2, 0.22, 0.25, 0.3]))
-    sn = sb * F * 1e4
-    model = (f"**About {sn:.0f}bp.**\n\n1. Rates vol is quoted in normal (bp) terms because rate moves are closer to "
-             f"additive than proportional, and rates can go negative.\n2. Near the money, sigma_normal ~ "
-             f"sigma_lognormal x F = {sb*100:.0f}% x {F*100:.2f}% = {sn:.0f}bp per year.\n3. Daily: {sn/np.sqrt(252):.1f}bp. "
-             f"Structural sellers of vol: callable issuers' investors, MBS holders (short convexity), structured-note "
-             f"buyers. Structural buyers: mortgage servicers/hedgers, liability hedgers buying receivers.")
-    return Question("rates", "2F", "advanced:normal_vol", d, "f_nvol", seed,
-                    prompt=f"A 1y10y swaption is quoted at {sb*100:.0f}% lognormal (Black) vol with the forward at {F*100:.2f}%. Roughly what is the normal vol in bp?",
-                    parts=[Part("numeric", "Normal vol (bp/yr)", correct=sn, tol_rel=0.05, unit="bp")],
-                    free_text_prompt="Who is structurally long or short rates vol?",
-                    facts={"forward": F, "black_vol": sb, "normal_vol_bp": sn}, model_answer=model,
-                    rubric=["sigma_N ~ sigma_B x F", "Structural sellers and buyers of vol"])
-
-
-def f_krd(rng, d, seed):
-    c = base_curve()
-    m = int(rng.choice([7, 12, 20]))
-    b = Bond(0.045, m, 100e6)
-    pillars = [2, 5, 10, 20, 30]
-    kr = key_rate_dv01s(b.pv, c, pillars)
-    big = max(kr, key=lambda k: kr[k])
-    names = [f"{p}y" for p in pillars]
-    model = (f"**Mostly {big}y.**\n\n1. Key-rate DV01 bumps one pillar at a time (triangular bumps) and reprices. "
-             f"It shows WHERE on the curve your duration sits.\n2. A {m}y bond's cash flows sit up to {m}y, so its "
-             f"risk lands in the pillars bracketing {m}y: " + ", ".join(f"{k}y {fmt_ccy(v)}" for k, v in kr.items()) +
-             f".\n3. The KR DV01s add up to the parallel DV01 ({fmt_ccy(sum(kr.values()))}).")
-    return Question("rates", "2F", "advanced:krd", d, "f_krd", seed,
-                    prompt=f"You own GBP 100m of a 4.5% {m}y gilt. Which key-rate bucket carries the largest DV01?",
-                    parts=[Part("mcq", "Largest bucket", names, pillars.index(big))],
-                    free_text_prompt="What does key-rate DV01 tell you that parallel DV01 doesn't?",
-                    facts={"key_rate_dv01": kr}, model_answer=model, rubric=["Triangular bumps", "Bracketing pillars", "Sum = parallel"],
-                    charts=[chart_bar("Key-rate DV01 (GBP per bp)", names, list(kr.values()), "GBP")])
-
-
+# =============================================================================
 CONCEPTS = [
-    ("advanced:swap_spreads", "Why can swap spreads (swap rate minus government yield) be negative, as in 30y USD?",
-     ["Balance-sheet and capital costs make it expensive for dealers to hold bonds, while heavy government supply and demand to receive fixed (e.g. pension liability hedging) pushes swap rates below yields",
-      "Because swaps carry more credit risk than government bonds",
-      "Because the floating leg of a swap pays a higher rate than repo",
-      "Negative spreads are an arbitrage that is always closed immediately"],
-     "Swap spreads are not a pure credit spread any more. Holding bonds uses dealer balance sheet (leverage ratio, capital), repo financing is not free, and heavy bond supply cheapens bonds. Meanwhile long-dated receivers (pensions, insurers) push swap rates down. The 'arbitrage' of buying the bond and paying fixed needs balance sheet that is scarce."),
-    ("advanced:fly", "Why weight a 2s5s10s butterfly using PCA rather than 50/50 DV01 weights?",
-     ["PCA weights neutralise the trade to the level and slope factors as they actually move historically, so the P&L isolates curvature",
-      "DV01 weights are always wrong",
-      "PCA weights make the trade cheaper to execute",
-      "PCA weights maximise carry"],
-     "A DV01-neutral 50/50 fly is hedged to parallel moves but not to slope: if the curve steepens, the wings move differently and you get slope P&L. PCA (or regression) weights use how the 2y, 5y and 10y historically co-move, hedging both level and slope so you are left with the curvature view."),
-    ("advanced:ldi_2022", "In September 2022, why did UK LDI funds sell gilts as gilt yields spiked?",
-     ["They held leveraged long-duration positions (receivers/repo-funded gilts); rising yields triggered collateral calls they met by selling gilts, which pushed yields higher still until the BoE stepped in",
-      "They wanted to buy cheap gilts but ran out of time",
-      "They were short duration and took profit",
-      "Regulation forced them to switch from gilts to equities"],
-     "Pension LDI funds hedge long liabilities with leveraged long duration (receive-fixed swaps, repo-funded gilts). The mini-budget sent long gilt yields up very fast. The hedges lost value and needed collateral within days; funds sold their most liquid asset, long gilts, into a falling market: forced selling of duration, a doom loop. The BoE bought long gilts temporarily to break it."),
-    ("advanced:delivery_option", "Why do bond futures usually trade cheap to the forward price of the CTD?",
-     ["The short owns delivery options (which bond, when to deliver), and the futures price is reduced by their value",
-      "Futures have no carry",
-      "Futures are more liquid so they trade rich",
-      "The long can choose which bond to receive"],
-     "The short chooses the bond (switch option) and the timing within the delivery month. Those options have value to the short, so the long pays less: futures trade below the CTD forward / CF, i.e. the net basis is positive and equals the option value at fair pricing."),
+    ("advanced:swap_spreads", "Why can swap spreads (swap rate minus government yield) be negative, as in 30Y USD?",
+     "Dealer balance-sheet costs make holding bonds expensive, heavy government supply cheapens bonds, and liability hedgers receive fixed, pushing swap rates below yields",
+     ["Swaps carry more credit risk than government bonds", "The floating leg pays more than repo", "It is a free arbitrage that is always closed at once"],
+     "Holding bonds uses scarce balance sheet; repo is not free; supply cheapens bonds; pensions receive long swaps. The 'arbitrage' needs balance sheet nobody has cheaply."),
+    ("advanced:fly", "Why weight a 2s5s10s butterfly with PCA rather than 50/50 DV01?",
+     "PCA weights hedge level and slope as they actually co-move, isolating curvature",
+     ["DV01 weights are always wrong", "PCA weights are cheaper to execute", "PCA weights maximise carry"],
+     "A 50/50 DV01 fly is only hedged to parallel moves; steepening moves the wings differently. PCA weights hedge both level and slope."),
+    ("advanced:ldi_2022", "In September 2022, why did UK LDI funds sell gilts as yields spiked?",
+     "Leveraged long-duration hedges lost value, collateral calls had to be met fast, so they sold gilts into a falling market until the BoE stepped in",
+     ["They wanted to buy cheap gilts", "They were short duration and took profit", "Regulation forced a switch to equities"],
+     "LDI funds hedge long liabilities with leveraged long duration. The mini-budget sent long yields up fast, the hedges needed collateral within days, and funds sold their most liquid asset: forced selling of duration, a doom loop."),
+    ("advanced:delivery_option", "Why do bond futures usually trade cheap to the CTD's forward price?",
+     "The short owns delivery options (which bond, when), and their value lowers the futures price",
+     ["Futures have no carry", "Futures are more liquid so they trade rich", "The long chooses which bond to receive"],
+     "The short's switch and timing options have value, so the long pays less: positive net basis equals the option value."),
+    ("advanced:vol_owners", "Who is structurally SHORT rates volatility?",
+     "MBS and callable-bond investors (short the prepayment/call option)",
+     ["Mortgage servicers buying receivers", "Liability hedgers buying receiver swaptions", "Nobody: rates vol has no natural sellers"],
+     "Holders of MBS and callables are short the borrower's or issuer's option, so they are short vol and short convexity; callable issuance and structured notes also supply vol."),
 ]
 
 
-def f_concept(rng, d, seed):
-    topic, q, opts, why = CONCEPTS[int(rng.integers(len(CONCEPTS)))]
-    order = rng.permutation(len(opts))
-    o = [opts[i] for i in order]
-    correct = int(np.where(order == 0)[0][0])
-    return Question("rates", "2F", topic, d, "f_concept", seed, prompt=q,
-                    parts=[Part("mcq", "Answer", o, correct)], free_text_prompt="Explain in your own words.",
-                    facts={"answer": opts[0]}, model_answer=f"**{opts[0]}.**\n\n{why}", rubric=[opts[0], why])
+def f_l1(rng, lvl, seed):
+    topic, q, ans, wrong, why = CONCEPTS[int(rng.integers(len(CONCEPTS)))]
+    opts, corr = shuffle_opts(rng, ans, wrong)
+    return Q("2F", topic, lvl, "f_l1_concept", seed, q, [mcq("Answer", opts, corr)], "Explain in your own words.",
+             f"**{ans}.**\n\n{why}", [ans, why])
+
+
+def f_l2_ctd(rng, lvl, seed):
+    basket = [(0.04, 8.0), (0.05, 14.0), (0.035, 25.0)]
+    y = float(rng.choice([0.03, 0.045, 0.075])); rows = ctd_analysis(basket, y)
+    # futures trade below every bond's P/CF (positive basis everywhere: no arbitrage; the gap is carry + delivery option)
+    F = round(min(r["p_over_cf"] for r in rows) - float(rng.uniform(0.1, 0.4)), 3)
+    g = {"futures_price": F}
+    labels = {"futures_price": "Futures price"}
+    names = [f"{c*100:.1f}% {m:.0f}Y" for c, m in basket]
+    for i, r in enumerate(rows):
+        g[f"price_{i}"] = round(r["price"], 3); labels[f"price_{i}"] = f"{names[i]} price"
+        g[f"cf_{i}"] = round(r["cf"], 4); labels[f"cf_{i}"] = f"{names[i]} conversion factor"
+    solver = lambda gv: [min(gv[f"price_{i}"] - gv["futures_price"] * gv[f"cf_{i}"] for i in range(3))]
+    basis = [g[f"price_{i}"] - F * g[f"cf_{i}"] for i in range(3)]
+    ctd = int(np.argmin(basis))
+    q = Q("2F", "advanced:ctd", lvl, "f_l2_ctd", seed,
+          "Using the prices, conversion factors and futures price in the Givens, which bond is cheapest to deliver, and what "
+          "is its gross basis?", [mcq("CTD", names, ctd), num("CTD gross basis (price points)", tol_abs=0.01)],
+          "Explain how the short chooses.", "", ["Gross basis = price - futures x CF", "CTD = lowest basis"])
+    attach_givens(q, g, labels, solver)
+    q.model_answer = (f"**{names[ctd]}, basis {q.parts[1].correct:.3f}.**\n\n1. The short delivers the bond that costs least "
+                      f"relative to what they are paid (futures x CF): lowest gross basis.\n2. Bases: " +
+                      ", ".join(f"{n} {b:.3f}" for n, b in zip(names, basis)) +
+                      f".\n3. At yields {'above' if y > 0.06 else 'below'} the 6% notional coupon, "
+                      f"{'high' if y > 0.06 else 'low'}-duration bonds tend to be CTD.")
+    return q
+
+
+def f_l2_normal_vol(rng, lvl, seed):
+    F = float(rng.choice([3.0, 3.5, 4.0, 4.5])); sb = float(rng.choice([20, 22, 25, 30]))
+    g = {"forward_pct": F, "black_vol_pct": sb}
+    labels = {"forward_pct": "Forward swap rate (%)", "black_vol_pct": "Lognormal (Black) vol (%)"}
+    solver = lambda gv: [gv["black_vol_pct"] / 100 * gv["forward_pct"] / 100 * 1e4, gv["black_vol_pct"] / 100 * gv["forward_pct"] / 100 * 1e4 / np.sqrt(252)]
+    q = Q("2F", "advanced:normal_vol", lvl, "f_l2_nvol", seed,
+          "Convert the lognormal vol in the Givens to an approximate normal (bp) vol, and to a daily bp move.",
+          [num("Normal vol (bp/yr)", "bp", tol_rel=0.02), num("Daily move (bp, 252 days)", "bp", tol_rel=0.03)],
+          "Why do rates desks quote normal vol?", "", ["sigma_N ~ sigma_B x F", "Daily = annual / sqrt(252)"])
+    attach_givens(q, g, labels, solver)
+    q.model_answer = (f"**About {q.parts[0].correct:.0f}bp a year, {q.parts[1].correct:.1f}bp a day.** Near the money "
+                      f"sigma_N ~ sigma_B x F. Rate moves are closer to additive than proportional (and rates can go "
+                      f"negative), so desks quote normal vol.")
+    return q
+
+
+def f_l3_krd(rng, lvl, seed):
+    c = base_curve(); m = int(rng.choice([7, 12, 20])); b = Bond(0.045, m, 100e6); pillars = [2, 5, 10, 20, 30]
+    kr = key_rate_dv01s(b.pv, c, pillars)
+    hedge_dv01 = {p: risk(Swap(0, p, par_swap_rate(c, 0, p), 1e6, "pay"), c).dv01 for p in pillars}
+    g = {}
+    labels = {}
+    for p in pillars:
+        g[f"kr_{p}"] = round(kr[p], 0); labels[f"kr_{p}"] = f"Bond key-rate DV01 at {p}Y (GBP/bp)"
+    for p in (5, 10, 20):
+        g[f"pay_dv01_{p}"] = round(hedge_dv01[p], 2); labels[f"pay_dv01_{p}"] = f"DV01 of paying GBP 1m {p}Y swap (GBP/bp)"
+    big = sorted(pillars, key=lambda p: -abs(kr[p]))[:2]
+    solver = lambda gv: [-gv[f"kr_{p}"] / gv[f"pay_dv01_{p}"] for p in (5, 10, 20)]
+    q = Q("2F", "advanced:krd", lvl, "f_l3_krd", seed,
+          f"You own GBP 100m of a 4.5% {m}Y gilt. Hedge its 5Y, 10Y and 20Y key-rate DV01s by paying fixed in 5Y, 10Y and "
+          f"20Y swaps (assume each swap's DV01 sits in its own bucket). How much notional of each (GBP m)?",
+          [num("5Y swap (GBP m)", "m", tol_rel=0.02, tol_abs=0.2), num("10Y swap (GBP m)", "m", tol_rel=0.02, tol_abs=0.2),
+           num("20Y swap (GBP m)", "m", tol_rel=0.02, tol_abs=0.2)], "What does key-rate DV01 tell you that parallel DV01 does not?",
+          "", ["Notional = -KR DV01 / swap DV01 per 1m", "Hedge per bucket", "Residual curve risk"])
+    attach_givens(q, g, labels, solver)
+    q.model_answer = (f"**5Y {q.parts[0].correct:.1f}m, 10Y {q.parts[1].correct:.1f}m, 20Y {q.parts[2].correct:.1f}m.**\n\n1. "
+                      f"Key-rate DV01 bumps one pillar at a time, showing WHERE the duration sits (here mostly "
+                      f"{big[0]}Y and {big[1]}Y).\n2. Each hedge = bucket DV01 / DV01 of paying GBP 1m in that tenor.\n3. "
+                      f"Simplification: real swaps spread DV01 across neighbouring buckets, so you would solve the full matrix.")
+    q.charts = [chart_bar("Bond key-rate DV01 (GBP/bp)", [f"{p}Y" for p in pillars], [kr[p] for p in pillars], "GBP")]
+    return q
+
+
+def f_l3_ldi(rng, lvl, seed):
+    dv = float(rng.choice([2e6, 3e6, 5e6])); move = float(rng.choice([100, 120, 150])); coll = float(rng.choice([300e6, 400e6, 600e6]))
+    g = {"hedge_dv01": dv, "yield_move_bp": move, "collateral_pool": coll}
+    labels = {"hedge_dv01": "DV01 of the fund's receive-fixed / repo gilt hedges (GBP/bp)", "yield_move_bp": "Rise in long gilt yields (bp)",
+              "collateral_pool": "Liquid collateral available (GBP)"}
+    solver = lambda gv: [gv["hedge_dv01"] * gv["yield_move_bp"] / 1e6, gv["collateral_pool"] / gv["hedge_dv01"]]
+    q = Q("2F", "advanced:ldi_2022", lvl, "f_l3_ldi", seed,
+          "An LDI fund hedges pension liabilities with leveraged long duration (Givens). Long gilt yields jump. (a) How much "
+          "collateral is called (GBP m)? (b) How many bp can yields rise before the liquid collateral runs out?",
+          [num("(a) Collateral call (GBP m)", "m", tol_rel=0.01), num("(b) bp until collateral is exhausted", "bp", tol_rel=0.01)],
+          "Explain the 2022 doom loop.", "", ["Collateral call ~ DV01 x move", "Forced selling of gilts raises yields further"])
+    attach_givens(q, g, labels, solver)
+    q.model_answer = (f"**(a) GBP {q.parts[0].correct:,.0f}m, (b) {q.parts[1].correct:.0f}bp.**\n\n1. The hedges lose ~DV01 x "
+                      f"move, paid as variation margin. Liabilities fall in value too, but they need no cash.\n2. Once "
+                      f"liquid collateral runs out, funds sell gilts, which pushes yields up, which triggers more calls: a "
+                      f"doom loop that the BoE broke by buying long gilts.")
+    return q
 
 
 TOPICS = {
-    "2B": ("Convexity intuition", [b_barbell, b_maturity_squared, b_long_convexity_cost, b_mortgage]),
-    "2C": ("Curve trades", [c_label, c_sizing, c_boe_view]),
-    "2D": ("Carry and roll-down", [d_carry_roll]),
-    "2E": ("Pricing central banks", [e_probability, e_reaction]),
-    "2F": ("Advanced", [f_ctd, f_normal_vol, f_krd, f_concept, f_concept]),
+    "2B": ("Convexity intuition", {1: [b_l1_barbell, b_l1_mortgage, b_l1_cost], 2: [b_l2_maturity, b_l2_barbell],
+                                   3: [b_l3_straddle]}),
+    "2C": ("Curve trades", {1: [c_l1_label, c_l1_convexity, c_l1_convexity, c_l1_boe], 2: [c_l2_pnl, c_l2_sizing, c_l2_convexity_pnl],
+                            3: [c_l3_full, c_l3_fly]}),
+    "2D": ("Carry and roll-down", {1: [d_l1], 2: [d_l2], 3: [d_l3]}),
+    "2E": ("Pricing central banks", {1: [e_l1], 2: [e_l2], 3: [e_l3]}),
+    "2F": ("Advanced", {1: [f_l1], 2: [f_l2_ctd, f_l2_normal_vol], 3: [f_l3_krd, f_l3_ldi]}),
 }
 
 
 def make_generator(code: str):
-    fns = TOPICS[code][1]
+    levels = TOPICS[code][1]
 
-    def gen(seed: int, difficulty: int) -> Question:
+    def gen(seed: int, difficulty: int):
         rng = np.random.default_rng(seed)
+        fns = levels[difficulty]
         return fns[int(rng.integers(len(fns)))](rng, difficulty, seed)
     return gen

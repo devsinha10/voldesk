@@ -22,6 +22,61 @@ if not api_available():
     st.info("No ANTHROPIC_API_KEY found: written answers are self-marked against the engine model answer. "
             "Set the key and restart to enable Claude marking and session reviews.")
 
+# ---------------------------------------------------------------------------
+# Progress by level (question version 2+)
+# ---------------------------------------------------------------------------
+import prep_options as _po  # noqa: E402
+import prep_rates as _pr  # noqa: E402
+from prep_options import greek_matrix  # noqa: E402
+
+st.subheader("Progress by level")
+st.caption("A level is passed at 80%+ over its last 20 questions (a question counts as correct at 7/10 or more). "
+           "Every level stays open; the recommendation is the lowest level you have not passed yet.")
+stats = db.level_stats()
+by = {(x["section"], x["subsection"], x["level"]): x for x in stats}
+rows = []
+for section, subs in (("options", _po.SUBSECTIONS), ("rates", _pr.SUBSECTIONS)):
+    for code, (title, _) in subs.items():
+        row = {"Section": section, "Sub-section": f"{code} {title}"}
+        for lvl in (1, 2, 3):
+            x = by.get((section, code, lvl))
+            row[f"L{lvl}"] = "-" if x is None else f"{x['accuracy']*100:.0f}% ({x['window']}/20){' ✅' if x['passed'] else ''}"
+        row["Recommended"] = f"Level {db.recommended_level(stats, section, code)}"
+        rows.append(row)
+st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+tc = st.columns(2)
+for col, section in zip(tc, ("options", "rates")):
+    tr = db.level_trend(section)
+    fig = go.Figure()
+    colors = {1: "#2A9D6F", 2: "#2E6FD8", 3: "#B8443A"}
+    for lvl, ys in sorted(tr.items()):
+        fig.add_trace(go.Scatter(y=[y * 100 for y in ys], mode="lines+markers", name=f"Level {lvl}",
+                                 line=dict(color=colors.get(lvl, "#888"))))
+    fig.add_hline(y=80, line=dict(color="#999", dash="dot"), annotation_text="pass line")
+    fig.update_layout(title=f"{section.capitalize()}: rolling accuracy (last 10) per level", height=280,
+                      yaxis_title="% correct", xaxis_title="questions answered at that level", yaxis_range=[0, 105],
+                      margin=dict(l=40, r=10, t=40, b=30), template="plotly_white")
+    col.plotly_chart(fig, use_container_width=True)
+    if not tr:
+        col.caption("No level-tagged answers yet.")
+
+with st.expander("1A coverage matrices (Greek x driver x direction x call/put x moneyness x long/short)"):
+    for lvl in (1, 2):
+        cells = greek_matrix.all_cells(lvl)
+        cov = db.covered_cells(greek_matrix.matrix_name(lvl))
+        seen = sum(1 for c in cells if c in cov)
+        st.markdown(f"**Level {lvl}:** {seen} of {len(cells)} cells answered ({seen / len(cells) * 100:.0f}%).")
+        greeks = greek_matrix.L1_GREEKS if lvl == 1 else greek_matrix.L2_GREEKS
+        grid = []
+        for g in greeks:
+            r = {"Greek": g}
+            for d in greek_matrix.DRIVERS:
+                sub = [c for c in cells if c.startswith(f"{g}|{d}|")]
+                r[d] = f"{sum(1 for c in sub if c in cov)}/{len(sub)}"
+            grid.append(r)
+        st.dataframe(pd.DataFrame(grid), hide_index=True, use_container_width=True)
+
 left, right = st.columns([1.2, 1])
 with left:
     st.subheader("Weakest topics (spaced repetition)")

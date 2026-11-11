@@ -34,11 +34,56 @@ python -m pytest
 | `engine/structures.py` | Structures, scenario markets (spot/vol/skew/term/time bumps), desk-unit exposures |
 | `engine/pnl_attribution.py` | Taylor P&L attribution (simulator) and exact revaluation breakdown (drills) |
 | `engine/market_sim.py` | Simulator market: correlated currencies, stochastic vol, jumps, regimes, events, intervention |
-| `prep_options/`, `prep_rates/` | Question generators with engine model answers |
+| `prep_options/`, `prep_rates/` | Question generators by level, with Givens, solvers and engine model answers |
+| `tools/`, `audit/` | Level audit, 1A coverage report, topic coverage check and their outputs |
 | `simulator/` | Book, client flow, session (risk, limits, P&L ledger, log), debriefs |
 | `grading/` | Question model, Claude marking (structured JSON, SQLite cache) |
 | `progress/` | SQLite storage, Leitner boxes, mixed review |
 | `views/` | Streamlit pages |
+
+## Interview-prep levels
+
+Every sub-section in Sections 1 and 2 has three levels. All levels stay open; the app recommends the next one.
+
+| Level | What it tests | Calculations |
+|---|---|---|
+| **1: directional intuition** | Which way does it move, which is bigger, are you long or short, and why | None asked of you (the model answer may use engine numbers to illustrate) |
+| **2: combinations** | The same intuition applied to structures, mixed positions and multi-step reasoning | Light, and only with every input in a **Givens** box |
+| **3: calculations plus subtler concepts** | Second-order effects, sticky strike vs sticky delta, breakevens, sized P&L, DV01 weighting, approximation vs full repricing | Yes, every input in the **Givens** box (a few questions ask you to compute D_mod or DV01 yourself) |
+
+Examples of the step-up: 1A goes from first-order Greek directions (L1) to second-order Greek directions (L2) to
+sqrt(T) scaling, delta-hedged P&L and theta breakevens (L3). 1B goes from outright calls/puts (L1) to structures and
+delta-hedged versions (L2) to mixes with vanna/volga/charm, combined shocks and a Greek-based P&L estimate (L3). In rates,
+every 2A stage (bonds, futures and repo, swaps, swaptions, mixed books) spans all three levels.
+
+**Givens rule.** A question that needs a number carries a `givens` dict and a `solver(givens)` that reads only those
+givens; the answer key is `solver(givens)` and the UI shows every given. `tests/test_levels.py` enforces this for
+every sub-section at every level, and checks Level 1 never asks for a number. Bond and swap answers show both the
+duration + convexity approximation and the exact repriced P&L, and state the gap.
+
+**1A coverage matrices.** Level 1 covers delta, gamma, theta, vega, rho; Level 2 covers vanna, volga, charm, speed,
+veta. Each matrix is Greek x driver (spot, time, vol) x direction x call/put x ITM/ATM/OTM x long/short = 360 cells.
+Uncovered cells are sampled first. A question is only used if the engine gives the same clear direction for a small
+and a large version of the shock; a handful of ATM cells (e.g. ATM vega vs vol) resolve to a robust "roughly
+unchanged". Coverage is shown on the home screen.
+
+**Progress.** Accuracy is tracked per section, sub-section and level (a question counts as correct at 7/10+). A level
+is passed at 80% or more over its last 20 questions. Only answers to the new (version 2) questions count towards
+levels; older answers stay in the database and in the Leitner boxes.
+
+**Audit tools** (outputs in `audit/`):
+
+```bash
+python -m tools.audit_levels
+```
+
+```bash
+python -m tools.coverage_report
+```
+
+```bash
+python -m tools.topic_coverage
+```
 
 ## Conventions (also shown on screen)
 

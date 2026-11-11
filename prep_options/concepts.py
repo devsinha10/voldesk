@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from engine.fx_conventions import TENORS
 from engine.fx_pricer import price
-from engine.pnl_attribution import attribute_legs
-from engine.structures import build, flat_market
-from grading.question import Part, Question, chart_bar, chart_line
+from engine.structures import build
+from grading.question import Part, Question, chart_bar
+from prep_options import calcs
 from prep_options.common import fmt_num, fx_market, pick_pair, static_market
 
 
@@ -16,8 +15,8 @@ from prep_options.common import fmt_num, fx_market, pick_pair, static_market
 # No-arbitrage
 # ---------------------------------------------------------------------------
 def q_arbitrage(rng: np.random.Generator, difficulty: int, seed: int) -> Question:
-    variants = ["call_spread"] + (["put_spread", "butterfly", "calendar"] if difficulty >= 2 else []) + \
-               (["parity"] if difficulty >= 2 else [])
+    # Level 1 intuition version: what do you do? (the sized version with Givens is calcs.q_arb_calc)
+    variants = ["call_spread", "call_spread", "put_spread", "butterfly", "calendar"]
     v = str(rng.choice(variants))
     S, r, sig = 100.0, 0.0, float(rng.choice([0.15, 0.2, 0.25]))
     T = float(rng.choice([0.25, 0.5, 1.0]))
@@ -103,123 +102,17 @@ def q_arbitrage(rng: np.random.Generator, difficulty: int, seed: int) -> Questio
                  f"hedge with the forward: profit about {profit/1e-4:.1f} USD pips per EUR.")
         facts = {"C_minus_P": lhs, "S_dff_minus_K_dfd": rhs, "mispricing": profit, "rich_leg": rich}
         profit = profit / 1e-4
-    return Question(section="options", subsection="1C", topic=f"concepts:arbitrage", difficulty=difficulty,
+    return Question(section="options", subsection="1C", topic="concepts:arbitrage", difficulty=difficulty,
                     template=f"arb_{v}", seed=seed, prompt=prompt,
-                    parts=[Part("mcq", "Trade", opts, correct),
-                           Part("numeric", "Locked-in profit per unit" + (" (pips)" if v == "parity" else ""),
-                                correct=float(profit), tol_abs=0.05 if v != "parity" else 1.0)],
+                    parts=[Part("mcq", "Trade", opts, correct)],
                     free_text_prompt="Explain the arbitrage and the bound being violated.",
                     facts=facts, model_answer=model,
-                    rubric=["Identifies the violated bound", "Correct direction of trade", "Locked-in profit"])
+                    rubric=["Identifies the violated bound", "Correct direction of trade"])
 
 
 # ---------------------------------------------------------------------------
 # Gamma / theta, implied vs realised
 # ---------------------------------------------------------------------------
-def q_breakeven(rng: np.random.Generator, difficulty: int, seed: int) -> Question:
-    pair = pick_pair(rng)
-    base = fx_market(pair)
-    tenor = str(rng.choice(["1W", "1M", "3M"]))
-    tau = TENORS[tenor]
-    v = base.vol(base.forward(tau), tau)
-    mkt = flat_market(base.pair, base.spot, base.rd, base.rf, v)
-    s = build("straddle", mkt, tenor, 1e7)
-    e = s.exposure(mkt)
-    gamma_unit = e.gamma_1pct / (0.01 * mkt.spot)       # d2V/dS2 for the whole position
-    dS = np.sqrt(2 * abs(e.theta) / gamma_unit)
-    pct = dS / mkt.spot * 100
-    rule = v * 100 / np.sqrt(365)
-    model = (f"**About {pct:.2f}% per day ({dS/mkt.pair.pip:,.0f} pips).**\n\n"
-             f"1. Intuition: a delta-hedged long option earns 0.5 x gamma x dS^2 from each move and pays theta each "
-             f"day. You break even when 0.5 x gamma x dS^2 = |theta|.\n"
-             f"2. dS = sqrt(2|theta|/gamma) = sqrt(2 x {abs(e.theta):,.0f} / {gamma_unit:,.0f}) = {dS:.{mkt.pair.decimals}f}.\n"
-             f"3. Rule of thumb: theta ~ -0.5 gamma S^2 vol^2 / 365, so the breakeven daily move is about "
-             f"vol / sqrt(365) = {v*100:.2f}% / 19.1 = {rule:.2f}%. Realised vol above implied wins, below loses.")
-    return Question(section="options", subsection="1C", topic="concepts:gamma_theta", difficulty=difficulty,
-                    template="breakeven", seed=seed,
-                    prompt=(f"You buy a {tenor} ATM {pair} straddle at {v*100:.2f}% vol and delta-hedge it. Spot is "
-                            f"{mkt.spot:.{mkt.pair.decimals}f}. Roughly how big a daily move (in %) do you need to "
-                            f"break even on theta?"),
-                    parts=[Part("numeric", "Breakeven daily move (%)", correct=float(pct), tol_rel=0.12, unit="%")],
-                    free_text_prompt="Explain the gamma/theta trade-off behind your number.",
-                    facts={"pair": pair, "vol": v, "theta_per_day": e.theta, "gamma_1pct": e.gamma_1pct,
-                           "breakeven_move_pct": pct, "rule_of_thumb_pct": rule},
-                    model_answer=model,
-                    rubric=["0.5 gamma dS^2 = theta", f"About {pct:.2f}%", "Equivalent to vol/sqrt(365)",
-                            "Realised vs implied determines P&L"])
-
-
-def q_realised_vs_implied(rng: np.random.Generator, difficulty: int, seed: int) -> Question:
-    pair = pick_pair(rng)
-    base = fx_market(pair)
-    tau = TENORS["1M"]
-    vi = round(base.vol(base.forward(tau), tau) * 100, 1)
-    vr = round(vi + float(rng.choice([-3, -2, 2, 3, 4])), 1)
-    days = int(rng.choice([5, 10]))
-    mkt = flat_market(base.pair, base.spot, base.rd, base.rf, vi / 100)
-    s = build("straddle", mkt, "1M", 1e7)
-    e = s.exposure(mkt)
-    gamma_unit = e.gamma_1pct / (0.01 * mkt.spot)
-    pnl = 0.5 * gamma_unit * mkt.spot ** 2 * ((vr / 100) ** 2 - (vi / 100) ** 2) * days / 365
-    # simulate a path at exactly the realised vol to show the noise around the formula
-    model = (f"**About {fmt_num(pnl)} {mkt.pair.quote}.**\n\n"
-             f"1. Intuition: a delta-hedged option's P&L is the gap between the variance you realise and the "
-             f"variance you paid for, weighted by cash gamma.\n"
-             f"2. Daily P&L ~ 0.5 x Gamma x S^2 x (realised^2 - implied^2) x dt.\n"
-             f"3. Here 0.5 x {gamma_unit:,.0f} x {mkt.spot:.4g}^2 x ({vr/100:.3f}^2 - {vi/100:.3f}^2) x {days}/365 = "
-             f"{pnl:,.0f}.\n4. Caveats: gamma changes as spot moves and time passes, and the P&L depends on WHEN the "
-             f"moves happen (path dependence); this is the constant-gamma estimate.")
-    return Question(section="options", subsection="1C", topic="concepts:implied_vs_realised", difficulty=difficulty,
-                    template="rv_iv", seed=seed,
-                    prompt=(f"You are long a delta-hedged 1M ATM {pair} straddle, {pair[:3]} 10m per leg, bought at "
-                            f"{vi:.1f}% implied. Over the next {days} days spot realises {vr:.1f}% vol and implied "
-                            f"is unchanged. Roughly what is your P&L (in {mkt.pair.quote}, use today's gamma)?"),
-                    parts=[Part("mcq", "Sign of P&L", ["Profit", "Loss"], 0 if pnl > 0 else 1),
-                           Part("numeric", f"P&L ({mkt.pair.quote})", correct=float(pnl), tol_rel=0.12)],
-                    free_text_prompt="Explain where the P&L comes from.",
-                    facts={"pair": pair, "implied": vi, "realised": vr, "days": days, "gamma_1pct": e.gamma_1pct,
-                           "gamma_d2V_dS2": gamma_unit, "spot": mkt.spot, "pnl_estimate": pnl, "theta_per_day": e.theta},
-                    model_answer=model,
-                    rubric=["P&L ~ 0.5 Gamma S^2 (realised^2 - implied^2) dt", "Sign from realised vs implied",
-                            "Path dependence / gamma changes"])
-
-
-def q_straddle_puzzle(rng: np.random.Generator, difficulty: int, seed: int) -> Question:
-    pair = pick_pair(rng)
-    mkt = fx_market(pair)
-    s = build("straddle", mkt, "1M", 1e7)
-    win = rng.random() < 0.5
-    if win:
-        dv = round(float(rng.uniform(0.8, 2.0)), 1)
-        m1 = mkt.pass_time(1).bump_vol(dv)
-        prompt = (f"You are long a 1M ATM {pair} straddle. A day later spot is exactly where it was, yet you made "
-                  f"money. Why?")
-        opts = ["Implied vol rose: the vega gain outweighed one day of theta",
-                "Theta is positive for a long straddle", "Gamma: spot must have moved",
-                "Rates moved in your favour"]
-    else:
-        pct = round(float(rng.uniform(0.6, 1.0)), 1)
-        dv = -round(float(rng.uniform(1.5, 3.0)), 1)
-        m1 = mkt.pass_time(1).bump_spot(pct).bump_vol(dv)
-        prompt = (f"You are long a 1M ATM {pair} straddle. A day later spot has moved {pct}%, yet you lost money. "
-                  f"Why?")
-        opts = ["Implied vol fell: the vega loss (plus theta) outweighed the gamma gain",
-                "Long straddles lose when spot moves", "Delta was too long", "Theta was positive"]
-    att = attribute_legs(s.legs, mkt, m1)
-    t = att.terms
-    model = (f"**{opts[0]}.**\n\n1. A long straddle is long gamma, long vega and short theta.\n"
-             f"2. Engine attribution: total {fmt_num(att.actual)} = delta {fmt_num(t['delta'])}, gamma "
-             f"{fmt_num(t['gamma'])}, vega {fmt_num(t['vega'])}, theta {fmt_num(t['theta'])}, volga "
-             f"{fmt_num(t['volga'])}, other {fmt_num(att.unexplained + t['vanna'] + t['rho'])}.\n"
-             f"3. Lesson: an option is a bet on both realised and implied vol; the vega leg can dominate a day's P&L.")
-    return Question(section="options", subsection="1C", topic="concepts:pnl_explain", difficulty=difficulty,
-                    template="straddle_puzzle", seed=seed, prompt=prompt,
-                    parts=[Part("mcq", "Main reason", opts, 0)], free_text_prompt="Explain with the Greeks.",
-                    facts={"pair": pair, "pnl": att.actual, "attribution": t, "vol_change_pts": dv},
-                    model_answer=model, rubric=["Identifies vega as main driver", "Mentions theta and gamma correctly"],
-                    charts=[chart_bar("P&L attribution", list(t.keys()), list(t.values()), mkt.pair.quote)])
-
-
 # ---------------------------------------------------------------------------
 # Skew and sticky rules
 # ---------------------------------------------------------------------------
@@ -263,42 +156,6 @@ def q_skew(rng: np.random.Generator, difficulty: int, seed: int) -> Question:
                     rubric=["Links RR sign to spot-vol correlation", correct_txt])
 
 
-def q_sticky(rng: np.random.Generator, difficulty: int, seed: int) -> Question:
-    pair = str(rng.choice(["USDJPY", "AUDUSD", "USDCAD", "EURUSD", "USDCHF"]))
-    mkt = fx_market(pair)
-    tau = TENORS["1M"]
-    pct = round(float(rng.uniform(1.0, 2.5)) * (1 if rng.random() < 0.5 else -1), 1)
-    k0 = mkt.atm_strike(tau)
-    v0 = mkt.vol(k0, tau)
-    ms = mkt.bump_spot(pct, sticky="strike")
-    k1 = ms.atm_strike(tau)
-    v1 = ms.vol(k1, tau)
-    md = mkt.bump_spot(pct, sticky="delta")
-    v1d = md.vol(md.atm_strike(tau), tau)
-    dv = (v1 - v0) * 100
-    word = "Rises" if dv > 0.02 else "Falls" if dv < -0.02 else "Unchanged"
-    opts = ["Rises", "Falls", "Unchanged"]
-    rr = static_market().quotes[pair]["1M"].rr25 * 100
-    model = (f"**Sticky strike: ATM vol {word.lower()} ({v0*100:.2f}% to {v1*100:.2f}%). Sticky delta: unchanged "
-             f"({v1d*100:.2f}%).**\n\n1. Sticky strike: each strike keeps its vol. When spot moves {pct:+.1f}%, the ATM "
-             f"strike moves to {k1:.{mkt.pair.decimals}f}, so ATM vol is read off the old smile at a "
-             f"{'higher' if pct > 0 else 'lower'} strike. With RR {rr:+.2f} ({'calls over puts' if rr > 0 else 'puts over calls'}), "
-             f"that strike's vol is {'higher' if dv > 0 else 'lower'}.\n2. Sticky delta: the smile moves with spot, so ATM "
-             f"vol is unchanged and each delta keeps its vol.\n3. Why it matters: your delta depends on the rule. Under "
-             f"sticky strike the 'smile delta' differs from the Black-Scholes delta by vega x d(vol)/dS.")
-    return Question(section="options", subsection="1C", topic="concepts:sticky", difficulty=difficulty,
-                    template="sticky", seed=seed,
-                    prompt=(f"{pair} 1M: ATM {v0*100:.2f}%, 25d RR {rr:+.2f}. Spot moves {pct:+.1f}%. Under a "
-                            f"**sticky-strike** smile, what happens to 1M ATM vol? And under **sticky delta**?"),
-                    parts=[Part("mcq", "Sticky strike: ATM vol", opts, opts.index(word)),
-                           Part("mcq", "Sticky delta: ATM vol", opts, 2)],
-                    free_text_prompt="Explain the difference and when traders assume each.",
-                    facts={"pair": pair, "spot_move_pct": pct, "atm_before": v0, "atm_after_sticky_strike": v1,
-                           "atm_after_sticky_delta": v1d, "rr25": rr},
-                    model_answer=model, rubric=["Sticky strike reads old smile at new ATM strike",
-                                                "Sticky delta leaves ATM vol unchanged", "Uses the RR sign"])
-
-
 # ---------------------------------------------------------------------------
 # Trade expression
 # ---------------------------------------------------------------------------
@@ -335,7 +192,6 @@ def q_trade(rng: np.random.Generator, difficulty: int, seed: int) -> Question:
     covering = [t for t, d in expiries if d > days]
     best = covering[0]
     exp_opts = [t for t, _ in expiries]
-    tau = TENORS[best]
     s = build("straddle", mkt, best, 1e6)
     prem = s.value(mkt) / 1e6
     be = prem / mkt.spot * 100
@@ -361,12 +217,184 @@ def q_trade(rng: np.random.Generator, difficulty: int, seed: int) -> Question:
                             "Mentions event vol crush / exit plan", "Mentions the main risk"])
 
 
-TEMPLATES = {1: [q_arbitrage, q_breakeven, q_straddle_puzzle, q_trade, q_skew],
-             2: [q_arbitrage, q_breakeven, q_realised_vs_implied, q_straddle_puzzle, q_skew, q_sticky, q_trade],
-             3: [q_arbitrage, q_realised_vs_implied, q_sticky, q_trade, q_skew, q_straddle_puzzle]}
+# ---------------------------------------------------------------------------
+# Level 1: which structure for which view
+# ---------------------------------------------------------------------------
+VIEW_MATCH = [
+    ("You expect a big move or a vol rise but have no view on direction.", "Long ATM straddle",
+     "It is delta-neutral at inception and maximises gamma and vega per premium. Risk: theta every day the move does not come."),
+    ("You think spot will pin close to today's level at expiry and realised vol will be low.", "Long butterfly centred at today's spot",
+     "The fly pays most if spot finishes at the body strike, costs little, and has capped risk. It is short gamma and short vega near the body."),
+    ("You think puts will get more expensive relative to calls (skew steepens towards puts).", "Long put / short call risk reversal, delta- and vega-hedged",
+     "Owning the put wing and selling the call wing isolates the skew. Hedge delta and residual vega so the P&L comes from the RR moving."),
+    ("You think front-end vol will rise relative to back-end vol (term structure inverts).", "Long the near expiry, short the far expiry (short calendar), vega-weighted",
+     "Being long short-dated vega and short long-dated vega profits from the front rising more. Weight by vega (or vega x sqrt(T) scaling) so a parallel move is roughly neutral."),
+    ("You expect a quiet, range-bound market and implied vol to drift lower.", "Short 25-delta strangle, delta-hedged",
+     "You collect theta and are short vega. Strangles leave room for moderate moves; the risk is a gap through a strike, so size for the tail."),
+    ("You want upside exposure cheaply and are happy to cap the gain.", "Call spread",
+     "Buying the near strike and selling the further strike cuts the premium (you sell back some of the upside vol). Delta-positive with capped payoff."),
+    ("You expect a large move but straddles look expensive; you accept needing a bigger move.", "Long 25-delta strangle",
+     "Cheaper than a straddle because both strikes are out of the money, but spot must travel further before it pays."),
+]
+
+
+def q_view_match(rng, difficulty, seed):
+    i = int(rng.integers(len(VIEW_MATCH)))
+    view, ans, why = VIEW_MATCH[i]
+    others = [v[1] for j, v in enumerate(VIEW_MATCH) if j != i]
+    rng.shuffle(others)
+    opts = [ans] + others[:3]
+    order = rng.permutation(4)
+    opts = [opts[k] for k in order]
+    correct = int(np.where(order == 0)[0][0])
+    pair = pick_pair(rng)
+    return Question("options", "1C", "concepts:trade_expression", difficulty, "view_match", seed,
+                    prompt=f"**{pair}.** {view} Which structure expresses the view best?",
+                    parts=[Part("mcq", "Structure", opts, correct)],
+                    free_text_prompt="Why this structure, and what is its main risk?",
+                    facts={"view": view, "answer": ans}, model_answer=f"**{ans}.**\n\n{why}",
+                    rubric=[ans, why])
+
+
+# ---------------------------------------------------------------------------
+# Level 2: explain P&L outcomes with the Greeks (engine attribution)
+# ---------------------------------------------------------------------------
+PUZZLES = {
+    "straddle_no_move_won": ("long", "straddle", "1M", "Spot is exactly where it was a day later, yet you made money. Why?",
+                             "Implied vol rose: the vega gain beat a day of theta"),
+    "straddle_moved_lost": ("long", "straddle", "1M", "A day later spot has moved {pct}%, yet you lost money. Why?",
+                            "Implied vol fell: the vega loss (plus theta) beat the gamma gain"),
+    "short_strangle_inside_lost": ("short", "strangle", "1M", "Spot stayed well inside both strikes, yet the short strangle lost money. Why?",
+                                   "Implied vol rose: you are short vega, and the vol move cost more than the theta earned"),
+    "calendar_lost_long_vega": ("long", "calendar", "1W", "You are long vega through the calendar, yet you lost money over two days. Why?",
+                                "Spot moved: the short near-dated option's gamma dominated (a calendar is short gamma)"),
+    "fly_pinned_lost": ("long", "butterfly", "1M", "Spot sat right on the body strike for a day, yet the long butterfly lost money. Why?",
+                        "Implied vol rose: a long fly is short vega near the body, which outweighed a day of theta"),
+    "call_rally_lost": ("long", "call", "1M", "Spot rallied {pct}% the day after an event, yet your long call lost money. Why?",
+                        "Event vol was crushed: the vega loss beat the delta gain"),
+}
+DISTRACT = ["Theta is positive for this position", "Delta was hedged, so P&L must be zero",
+            "Interest rates moved against you", "Gamma is negative for a long option"]
+
+
+def q_puzzle(rng, difficulty, seed):
+    from engine.pnl_attribution import revaluation_breakdown
+    from engine.structures import build
+    key = str(rng.choice(list(PUZZLES)))
+    side, kind, tenor, text, ans = PUZZLES[key]
+    pair = pick_pair(rng)
+    mkt = fx_market(pair)
+    sgn = 1 if side == "long" else -1
+    s = build(kind, mkt, tenor, 1e7, side=sgn, moneyness_delta=0.25 if kind == "call" else None)
+    for scale in (1.0, 1.5, 2.0, 3.0):
+        pct = round(0.8 * scale, 1)
+        if key == "straddle_no_move_won":
+            m1 = mkt.pass_time(1).bump_vol(1.0 * scale)
+        elif key == "straddle_moved_lost":
+            m1 = mkt.pass_time(1).bump_spot(0.8).bump_vol(-1.5 * scale)
+            pct = 0.8
+        elif key == "short_strangle_inside_lost":
+            m1 = mkt.pass_time(1).bump_spot(0.2).bump_vol(1.0 * scale)
+        elif key == "calendar_lost_long_vega":
+            m1 = mkt.pass_time(2).bump_spot(1.0 * scale)
+        elif key == "fly_pinned_lost":
+            m1 = mkt.pass_time(1).bump_vol(1.0 * scale)
+        else:
+            m1 = mkt.pass_time(1).bump_spot(0.6).bump_vol(-2.0 * scale)
+            pct = 0.6
+        bd = revaluation_breakdown(s.legs, mkt, m1)
+        want_win = key == "straddle_no_move_won"
+        if (bd["total"] > 0) == want_win:
+            break
+    total = bd.pop("total")
+    if (total > 0) != (key == "straddle_no_move_won"):
+        raise ValueError("puzzle story does not hold for these conditions")
+    main = max(bd, key=lambda k: abs(bd[k]))
+    opts = [ans] + list(rng.choice(DISTRACT, 3, replace=False))
+    order = rng.permutation(4)
+    opts = [opts[k] for k in order]
+    correct = int(np.where(order == 0)[0][0])
+    nice = {"delta": "delta", "gamma": "gamma (and higher-order spot)", "vega": "vega/vol", "theta": "theta"}
+    model = (f"**{ans}.**\n\n1. Engine P&L: {fmt_num(total)} {mkt.pair.quote}. Breakdown (spot, then vol, then "
+             f"time): " + ", ".join(f"{nice[k]} {fmt_num(v)}" for k, v in bd.items()) +
+             f". Biggest driver: {nice[main]}.\n2. Lesson: an option position is a bet on realised AND implied vol, "
+             f"and on time; one leg of the Greek P&L can swamp the one you were focused on.")
+    return Question("options", "1C", "concepts:pnl_explain", difficulty, f"puzzle_{key}", seed,
+                    prompt=f"**{pair}**: you are {side} a {tenor} {kind.replace('_', ' ')}"
+                           f"{' (25-delta)' if kind == 'call' else ''}. " + text.format(pct=pct),
+                    parts=[Part("mcq", "Main reason", opts, correct)],
+                    free_text_prompt="Explain using the Greeks.",
+                    facts={"pnl": total, "breakdown": bd, "puzzle": key}, model_answer=model,
+                    rubric=[ans, f"Largest P&L term: {nice[main]}"],
+                    charts=[chart_bar("P&L breakdown", list(bd.keys()), list(bd.values()), mkt.pair.quote)])
+
+
+# ---------------------------------------------------------------------------
+# Level 3: skew dynamics with numbers
+# ---------------------------------------------------------------------------
+def q_skew_pnl(rng, difficulty, seed):
+    from engine.structures import build
+    from grading.question import attach_givens
+    pair = str(rng.choice(["USDJPY", "AUDUSD", "USDCHF"]))
+    mkt = fx_market(pair)
+    s = build("risk_reversal", mkt, "1M", 2.5e7, side=int(rng.choice([1, -1])))
+    side = "long" if s.legs[0].notional > 0 else "short"
+    from engine.fx_pricer import greeks
+    vc = s.legs[0].notional * greeks(mkt.spot, s.legs[0].K, 1 / 12, mkt.rd, mkt.rf, mkt.vol(s.legs[0].K, 1 / 12), "C").vega * 0.01
+    vp = s.legs[1].notional * greeks(mkt.spot, s.legs[1].K, 1 / 12, mkt.rd, mkt.rf, mkt.vol(s.legs[1].K, 1 / 12), "P").vega * 0.01
+    d_atm = round(float(rng.uniform(0.5, 2.0)), 1)
+    d_rr = -round(float(rng.uniform(0.3, 1.0)), 1)
+    givens = {"vega_call_leg": round(vc, 0), "vega_put_leg": round(vp, 0), "d_atm": d_atm, "d_rr25": d_rr}
+    labels = {"vega_call_leg": f"Vega of your 25d call leg ({mkt.pair.quote}/vol pt, signed)",
+              "vega_put_leg": f"Vega of your 25d put leg ({mkt.pair.quote}/vol pt, signed)",
+              "d_atm": "Change in 1M ATM vol (pts)", "d_rr25": "Change in 1M 25d RR (vols)"}
+
+    def solver(g):
+        d_call = g["d_atm"] + g["d_rr25"] / 2
+        d_put = g["d_atm"] - g["d_rr25"] / 2
+        return [g["vega_call_leg"] * d_call + g["vega_put_leg"] * d_put]
+
+    q = Question("options", "1C", "concepts:skew", difficulty, "skew_pnl", seed,
+                 prompt=(f"**{pair}** risk-off: 1M ATM vol rises {d_atm} and the 25d RR moves {d_rr:+} (towards puts). "
+                         f"You are {side} a 1M 25d risk reversal (call over put). Assume the 25d fly is unchanged. "
+                         f"Estimate your vol P&L. Does the skew move help or hurt you?"),
+                 parts=[Part("numeric", f"Vol P&L ({mkt.pair.quote})", tol_rel=0.03, tol_abs=1),
+                        Part("mcq", "The skew move alone", ["Helps you", "Hurts you"], 0)],
+                 free_text_prompt="Explain the skew dynamics (why RRs move this way when spot falls).",
+                 rubric=["Wing vol = ATM + BF +/- RR/2", "Long RR loses when RR moves towards puts",
+                         "Spot-vol correlation drives skew moves"])
+    attach_givens(q, givens, labels, solver)
+    skew_only = givens["vega_call_leg"] * d_rr / 2 - givens["vega_put_leg"] * d_rr / 2
+    q.parts[1].correct = 0 if skew_only > 0 else 1
+    est = q.parts[0].correct
+    q.model_answer = (f"**About {fmt_num(est)} {mkt.pair.quote}; the skew move {'helps' if skew_only > 0 else 'hurts'} you "
+                      f"({fmt_num(skew_only)}).**\n\n1. With the fly fixed, 25d call vol moves dATM + dRR/2 = "
+                      f"{d_atm + d_rr/2:+.2f} and 25d put vol moves dATM - dRR/2 = {d_atm - d_rr/2:+.2f}.\n"
+                      f"2. P&L = vega_call x dvol_call + vega_put x dvol_put = {est:,.0f}.\n"
+                      f"3. Why skews move: in {pair} the base currency falls in risk-off and vol rises with it, so "
+                      f"downside (puts) reprices most: RRs move towards puts as spot falls (negative spot-vol correlation).")
+    q.facts = dict(givens)
+    return q
+
+
+# Levels: L1 views/structures, event expiry, basic no-arbitrage, why skew exists
+#         L2 explain P&L outcomes with Greeks
+#         L3 sticky strike/delta with numbers, breakevens, delta-hedged P&L, skew dynamics, arbitrage with numbers
+def _l3(fn):
+    return lambda rng, d, seed: fn(rng, d, seed, "1C")
+
+
+TEMPLATES = {1: [q_view_match, q_view_match, q_trade, q_arbitrage, q_skew],
+             2: [q_puzzle],
+             3: [_l3(calcs.q_sticky_calc), _l3(calcs.q_breakeven), _l3(calcs.q_rv_iv), _l3(calcs.q_arb_calc), q_skew_pnl]}
 
 
 def generate(seed: int, difficulty: int) -> Question:
-    rng = np.random.default_rng(seed)
-    fn = TEMPLATES[difficulty][int(rng.integers(len(TEMPLATES[difficulty])))]
-    return fn(rng, difficulty, seed)
+    for k in range(6):
+        rng = np.random.default_rng(seed + k)
+        fn = TEMPLATES[difficulty][int(rng.integers(len(TEMPLATES[difficulty])))]
+        try:
+            return fn(rng, difficulty, seed + k)
+        except ValueError:
+            continue
+    raise RuntimeError("could not generate a consistent question")

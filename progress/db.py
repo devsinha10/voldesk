@@ -57,7 +57,17 @@ CREATE TABLE IF NOT EXISTS sim_events (
     payload_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_session ON sim_events(session_id);
+CREATE TABLE IF NOT EXISTS coverage (
+    matrix TEXT NOT NULL,
+    cell TEXT NOT NULL,
+    seen INTEGER NOT NULL DEFAULT 0,
+    correct INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (matrix, cell)
+);
 """
+
+LEVEL_WINDOW = 20      # a level is judged on its last 20 questions
+LEVEL_PASS = 0.80      # ... and passed at 80% correct (a question is correct at 7/10+)
 
 N_BOXES = 5
 
@@ -73,6 +83,9 @@ def connect(path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
     con.row_factory = sqlite3.Row
     try:
         con.executescript(SCHEMA)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(attempts)")}
+        if "version" not in cols:  # migrate v1 databases
+            con.execute("ALTER TABLE attempts ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
         yield con
         con.commit()
     finally:
@@ -86,18 +99,23 @@ def log_attempt(section: str, subsection: str, topic: str, difficulty: int, ques
                 final_score: float, auto_score: Optional[float] = None,
                 llm_score: Optional[float] = None, answer: Any = None, feedback: Any = None,
                 template: str = "", seed: Optional[int] = None, pass_mark: float = 7.0,
-                path: Optional[Path] = None) -> bool:
+                path: Optional[Path] = None, version: int = 2,
+                coverage_cell: Optional[tuple] = None) -> bool:
     """Store an attempt and update that topic's Leitner box. Returns ``correct``."""
     correct = final_score >= pass_mark
     now = time.time()
     with connect(path) as con:
         con.execute(
             "INSERT INTO attempts (ts, section, subsection, topic, difficulty, question_id, template,"
-            " seed, auto_score, llm_score, final_score, correct, answer_json, feedback_json)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " seed, auto_score, llm_score, final_score, correct, answer_json, feedback_json, version)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (now, section, subsection, topic, difficulty, question_id, template, seed, auto_score,
              llm_score, final_score, int(correct), json.dumps(answer, default=str),
-             json.dumps(feedback, default=str)))
+             json.dumps(feedback, default=str), version))
+        if coverage_cell:
+            con.execute("INSERT INTO coverage (matrix, cell, seen, correct) VALUES (?,?,1,?) "
+                        "ON CONFLICT(matrix, cell) DO UPDATE SET seen = seen + 1, correct = correct + ?",
+                        (coverage_cell[0], coverage_cell[1], int(correct), int(correct)))
         row = con.execute("SELECT box, seen, correct FROM leitner WHERE topic=?", (topic,)).fetchone()
         if row is None:
             box = 2 if correct else 1
@@ -206,3 +224,63 @@ def session_events(session_id: int, path: Optional[Path] = None) -> list[dict]:
         rows = con.execute("SELECT payload_json FROM sim_events WHERE session_id=? ORDER BY id",
                            (session_id,)).fetchall()
     return [json.loads(r["payload_json"]) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Levels and coverage (question version 2+)
+# ---------------------------------------------------------------------------
+def level_stats(section: Optional[str] = None, min_version: int = 2,
+                path: Optional[Path] = None) -> list[dict]:
+    """Per (section, subsection, level): attempts, accuracy over the last 20, passed flag."""
+    q = "SELECT section, subsection, difficulty, correct, ts FROM attempts WHERE version >= ?"
+    args: list = [min_version]
+    if section:
+        q += " AND section = ?"
+        args.append(section)
+    q += " ORDER BY ts"
+    with connect(path) as con:
+        rows = con.execute(q, args).fetchall()
+    groups: dict = {}
+    for r in rows:
+        groups.setdefault((r["section"], r["subsection"], r["difficulty"]), []).append(r["correct"])
+    out = []
+    for (sec, sub, lvl), cs in sorted(groups.items()):
+        last = cs[-LEVEL_WINDOW:]
+        acc = sum(last) / len(last)
+        out.append({"section": sec, "subsection": sub, "level": lvl, "attempts": len(cs),
+                    "window": len(last), "accuracy": acc,
+                    "passed": len(last) >= LEVEL_WINDOW and acc >= LEVEL_PASS})
+    return out
+
+
+def recommended_level(stats: list[dict], section: str, subsection: str) -> int:
+    """Lowest level not yet passed (3 if all passed)."""
+    passed = {s["level"] for s in stats if s["section"] == section and s["subsection"] == subsection and s["passed"]}
+    for lvl in (1, 2, 3):
+        if lvl not in passed:
+            return lvl
+    return 3
+
+
+def level_trend(section: str, subsection: Optional[str] = None, window: int = 10, min_version: int = 2,
+                path: Optional[Path] = None) -> dict[int, list[float]]:
+    """Rolling accuracy (last ``window`` questions) per level, in attempt order."""
+    q = "SELECT difficulty, correct FROM attempts WHERE version >= ? AND section = ?"
+    args: list = [min_version, section]
+    if subsection:
+        q += " AND subsection = ?"
+        args.append(subsection)
+    q += " ORDER BY ts"
+    with connect(path) as con:
+        rows = con.execute(q, args).fetchall()
+    seq: dict[int, list[int]] = {}
+    for r in rows:
+        seq.setdefault(r["difficulty"], []).append(r["correct"])
+    return {lvl: [sum(cs[max(0, i - window + 1): i + 1]) / len(cs[max(0, i - window + 1): i + 1])
+                  for i in range(len(cs))] for lvl, cs in seq.items()}
+
+
+def covered_cells(matrix: str, path: Optional[Path] = None) -> dict[str, dict]:
+    with connect(path) as con:
+        rows = con.execute("SELECT cell, seen, correct FROM coverage WHERE matrix = ?", (matrix,)).fetchall()
+    return {r["cell"]: {"seen": r["seen"], "correct": r["correct"]} for r in rows}
